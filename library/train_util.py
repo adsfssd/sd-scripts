@@ -5286,25 +5286,52 @@ def get_timesteps_and_huber_c(
 
 
 def cosine_optimal_transport(X: torch.Tensor, Y: torch.Tensor, backend: str = "auto"):
-    """Compute an optimal assignment under cosine distance."""
+    """
+    Compute optimal transport between two sets of vectors using cosine distance.
 
-    X_norm = X / torch.norm(X, dim=1, keepdim=True)
-    Y_norm = Y / torch.norm(Y, dim=1, keepdim=True)
-    cost = -torch.mm(X_norm, Y_norm.t())
+    Parameters:
+        X: torch.Tensor of shape (n, d)
+        Y: torch.Tensor of shape (m, d)
+        backend: 'auto' (default), 'cuda', or 'scipy'
 
-    if backend == "cuda":
-        return _cuda_assignment(cost)
+    Returns:
+        cost matrix and a tuple of index tensors (row_indices, col_indices)
+    """
+    if X.numel() == 0 or Y.numel() == 0:
+        return torch.empty_like(X @ Y.t()), (
+            torch.empty(0, dtype=torch.long, device=X.device),
+            torch.empty(0, dtype=torch.long, device=Y.device),
+        )
+
+    eps = torch.finfo(X.dtype if X.is_floating_point() else torch.float32).eps
+
+    # Normalize input vectors (avoid division-by-zero/NaNs)
+    X_norms = torch.norm(X, dim=1, keepdim=True).clamp_min(eps)
+    Y_norms = torch.norm(Y, dim=1, keepdim=True).clamp_min(eps)
+    zero_rows_x = (X_norms <= eps).any()
+    zero_rows_y = (Y_norms <= eps).any()
+    if zero_rows_x or zero_rows_y:
+        logger.warning("Zero-norm rows detected in cosine optimal transport inputs; adding epsilon to avoid NaNs.")
+    X_norm = X / X_norms
+    Y_norm = Y / Y_norms
+
+    # Negative cosine similarity because we minimize cost
+    C = -torch.mm(X_norm, Y_norm.t())
+
     if backend == "scipy":
-        return _scipy_assignment(cost)
+        return _scipy_assignment(C)
+    if backend == "cuda":
+        return _cuda_assignment(C)
 
+    # Auto mode prefers CUDA, falls back to SciPy on failure
     try:
-        return _cuda_assignment(cost)
-    except (ImportError, RuntimeError) as exc:
-        #logger.warning(
-         #   "CUDA linear assignment not available, falling back to SciPy for optimal transport. "
-          #  f"Reason: {exc}"
-        #)
-        return _scipy_assignment(cost)
+        return _cuda_assignment(C)
+    except (ImportError, RuntimeError) as e:
+        logger.warning(
+            "CUDA linear assignment not available, falling back to SciPy for optimal transport. "
+            f"Reason: {str(e)}"
+        )
+        return _scipy_assignment(C)
 
 
 def _cuda_assignment(cost: torch.Tensor):
