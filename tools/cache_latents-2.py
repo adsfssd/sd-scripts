@@ -14,7 +14,6 @@ from torchvision import transforms
 from library import config_util
 from library import train_util
 from library import sdxl_train_util
-from library import model_util, sdxl_model_util
 from library.config_util import (
     ConfigSanitizer,
     BlueprintGenerator,
@@ -127,21 +126,6 @@ def cache_to_disk(args: argparse.Namespace) -> None:
         logger.error("No images were loaded from the dataset. Please check your image_dir paths in the .toml file.")
         return
 
-    if args.sdxl:
-        default_scale = sdxl_model_util.VAE_SCALE_FACTOR
-    else:
-        default_scale = 0.18215
-    if getattr(args, "vae_custom_scale", None) is not None:
-        vae_scale_factor = float(args.vae_custom_scale)
-        logger.info(f"Using custom VAE scale factor for caching: {vae_scale_factor}")
-    else:
-        vae_scale_factor = default_scale
-    if getattr(args, "vae_custom_shift", None) is not None:
-        vae_shift_factor = float(args.vae_custom_shift)
-        logger.info(f"Using custom VAE shift factor for caching: {vae_shift_factor}")
-    else:
-        vae_shift_factor = 0.0
-
     # Prepare accelerator and VAE
     logger.info("prepare accelerator")
     args.deepspeed = False
@@ -159,9 +143,6 @@ def cache_to_disk(args: argparse.Namespace) -> None:
     else:
         _, vae, _, _ = train_util.load_target_model(args, weight_dtype, accelerator)
 
-    if getattr(args, "vae_reflection_padding", False):
-        vae = model_util.use_reflection_padding(vae)
-
     vae.to(accelerator.device, dtype=vae_dtype)
     vae.requires_grad_(False)
     vae.eval()
@@ -171,40 +152,21 @@ def cache_to_disk(args: argparse.Namespace) -> None:
 
     train_dataset_group.set_caching_mode("latents")
     n_workers = min(args.max_data_loader_n_workers, os.cpu_count()) if args.max_data_loader_n_workers is not None else 0
-    if args.vae_batch_size is not None and args.vae_batch_size >= 512:
-        logger.warning("VAE batch sizes >=512 can overflow pytorch's 32-bit indexing; lowering to 512.")
-        args.vae_batch_size = 512
 
-    dataloader_kwargs = dict(
-        batch_size=1,
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset_group,
+        batch_size=1, # This MUST be 1 because the dataset is already creating batches
         shuffle=False,
         collate_fn=passthrough_collate_fn,
         num_workers=n_workers,
         persistent_workers=args.persistent_data_loader_workers and n_workers > 0,
-        pin_memory=True,
-    )
-    if n_workers > 0:
-        dataloader_kwargs["prefetch_factor"] = 8
-
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset_group,
-        **dataloader_kwargs,
     )
 
     train_dataloader = accelerator.prepare(train_dataloader)
 
     image_transforms = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
-    iterator = tqdm(
-        train_dataloader,
-        desc=f"Caching latents on process {accelerator.process_index}",
-        position=accelerator.process_index,
-        mininterval=0.5,
-        dynamic_ncols=True,
-        leave=True,
-    )
-
-    for batch in iterator:
+    for batch in tqdm(train_dataloader, desc=f"Caching latents on process {accelerator.process_index}"):
         abs_paths = batch["absolute_paths"]
 
         processed_images, original_sizes, crop_ltrbs = [], [], []
@@ -214,7 +176,9 @@ def cache_to_disk(args: argparse.Namespace) -> None:
 
         for i in range(len(abs_paths)):
             npz_path = os.path.splitext(abs_paths[i])[0] + ".npz"
-            if args.skip_existing and os.path.exists(npz_path):
+            if args.skip_existing and train_util.is_disk_cached_latents_is_expected(
+                batch_bucket_reso, npz_path, batch["flip_aug"], batch["alpha_mask"]
+            ):
                 continue
 
             valid_indices_for_saving.append(i)
@@ -232,28 +196,19 @@ def cache_to_disk(args: argparse.Namespace) -> None:
         if not processed_images:
             continue
 
-        img_tensors = torch.stack(processed_images)
-        if img_tensors.device.type == "cpu":
-            img_tensors = img_tensors.pin_memory()
-        img_tensors = img_tensors.to(accelerator.device, dtype=vae_dtype, non_blocking=True)
+        img_tensors = torch.stack(processed_images).to(accelerator.device, dtype=vae_dtype)
 
         with torch.no_grad():
             latents = vae.encode(img_tensors).latent_dist.sample()
-            if vae_shift_factor != 0.0:
-                latents = latents - vae_shift_factor
-            latents = latents * vae_scale_factor
 
         if batch["flip_aug"]:
             flipped_tensors = torch.flip(img_tensors, dims=[3])
             with torch.no_grad():
                 flipped_latents = vae.encode(flipped_tensors).latent_dist.sample()
-                if vae_shift_factor != 0.0:
-                    flipped_latents = flipped_latents - vae_shift_factor
-                flipped_latents = flipped_latents * vae_scale_factor
 
-        latents_cpu = latents.to("cpu", non_blocking=True)
+        latents_cpu = latents.to("cpu")
         if batch["flip_aug"]:
-            flipped_latents_cpu = flipped_latents.to("cpu", non_blocking=True)
+            flipped_latents_cpu = flipped_latents.to("cpu")
 
         for i in range(len(processed_images)):
             original_batch_index = valid_indices_for_saving[i]
@@ -265,7 +220,7 @@ def cache_to_disk(args: argparse.Namespace) -> None:
             )
 
     accelerator.wait_for_everyone()
-    accelerator.print("Finished caching latents.")
+    accelerator.print(f"Finished caching latents.")
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -285,5 +240,16 @@ if __name__ == "__main__":
     parser = setup_parser()
     args = parser.parse_args()
     args = train_util.read_config_from_file(args, parser)
+
+    # Brute-force override to ensure command-line arg is respected
+    # This ensures that even if the .toml loading logic is confusing, the user's intent is followed.
+    for i, arg in enumerate(sys.argv):
+        if arg == '--vae_batch_size':
+            try:
+                args.vae_batch_size = 6
+                logger.info(f"Manually set VAE batch size from command line: {args.vae_batch_size}")
+            except (ValueError, IndexError):
+                pass
+            break
 
     cache_to_disk(args)

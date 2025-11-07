@@ -183,6 +183,7 @@ class NetworkTrainer:
             if args.flow_use_ot:
                 logger.info("Using cosine optimal transport pairing for Rectified Flow batches.")
                 
+            shift_enabled = args.flow_uniform_shift or args.flow_uniform_static_ratio is not None
             distribution = getattr(args, "flow_timestep_distribution", "logit_normal")
             if distribution == "logit_normal":
                 if args.flow_logit_std <= 0:
@@ -192,20 +193,21 @@ class NetworkTrainer:
                     f"mean={args.flow_logit_mean}, std={args.flow_logit_std}."
                 )
             elif distribution == "uniform":
+                logger.info("Rectified Flow timesteps sampled uniformly in [0, 1].")
+            else:
+                raise ValueError(f"Unknown Rectified Flow timestep distribution: {distribution}")
+
+            if shift_enabled:
                 if args.flow_uniform_static_ratio is not None:
                     if args.flow_uniform_static_ratio <= 0:
                         raise ValueError("`--flow_uniform_static_ratio` must be positive.")
                     logger.info(
-                        f"Rectified Flow uniform timestep shift uses static ratio={args.flow_uniform_static_ratio}."
-                    )
-                elif args.flow_uniform_shift:
-                    logger.info(
-                        f"Rectified Flow uniform timestep shift uses base pixels={args.flow_uniform_base_pixels}."
+                        f"Rectified Flow timestep shift uses static ratio={args.flow_uniform_static_ratio}."
                     )
                 else:
-                    logger.info("Rectified Flow timesteps sampled uniformly in [0, 1] without additional shift.")
-            else:
-                raise ValueError(f"Unknown Rectified Flow timestep distribution: {distribution}")
+                    logger.info(
+                        f"Rectified Flow timestep shift uses base pixels={args.flow_uniform_base_pixels}."
+                    )
 
         if args.contrastive_flow_matching and not (args.v_parameterization or getattr(args, "flow_model", False)):
             raise ValueError("`--contrastive_flow_matching` requires either v-parameterization or Rectified Flow.")
@@ -1414,7 +1416,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--flow_uniform_shift",
         action="store_true",
-        help="apply resolution-dependent shift to uniform Rectified Flow timesteps (SD3-style) / UniformなRectified Flowタイムステップに解像度依存のシフトを適用する",
+        help="apply resolution-dependent shift to Rectified Flow timesteps (SD3-style) / Rectified Flowタイムステップに解像度依存のシフトを適用する",
     )
     parser.add_argument(
         "--flow_uniform_base_pixels",
@@ -1426,7 +1428,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--flow_uniform_static_ratio",
         type=float,
         default=None,
-        help="use a fixed sqrt(m/n) ratio (e.g. 2.5) for uniform Rectified Flow timestep shift; overrides resolution-based shift / 一定のsqrt(m/n)比率（例:2.5）でUniformなRectified Flowタイムステップをシフトする（解像度依存シフトを上書き）",
+        help="use a fixed sqrt(m/n) ratio (e.g. 2.5) for Rectified Flow timestep shift; overrides resolution-based shift / 一定のsqrt(m/n)比率（例:2.5）でRectified Flowタイムステップをシフトする（解像度依存シフトを上書き）",
     )
     parser.add_argument(
         "--contrastive_flow_matching",

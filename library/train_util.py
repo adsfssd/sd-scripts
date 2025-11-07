@@ -5363,9 +5363,10 @@ def get_noise_noisy_latents_and_timesteps(
         else:
             raise ValueError(f"Unknown flow_timestep_distribution: {distribution}")
 
-        if distribution == "uniform" and (
+        shift_requested = (
             getattr(args, "flow_uniform_shift", False) or getattr(args, "flow_uniform_static_ratio", None) is not None
-        ):
+        )
+        if sigmas is not None and shift_requested:
             static_ratio = getattr(args, "flow_uniform_static_ratio", None)
             if static_ratio is not None:
                 if static_ratio <= 0:
@@ -5373,14 +5374,16 @@ def get_noise_noisy_latents_and_timesteps(
                 ratios = torch.full((b_size,), float(static_ratio), device=latents.device, dtype=torch.float32)
             else:
                 if pixel_counts is None:
-                    raise ValueError(
-                        "Resolution-dependent Rectified Flow shift requires per-sample pixel counts."
-                    )
+                    raise ValueError("Resolution-dependent Rectified Flow shift requires pixel_counts.")
                 base_pixels = getattr(args, "flow_uniform_base_pixels", None)
                 if base_pixels is None or base_pixels <= 0:
                     raise ValueError("`flow_uniform_base_pixels` must be positive when using flow_uniform_shift.")
-                ratios = torch.sqrt(torch.as_tensor(pixel_counts, device=latents.device, dtype=torch.float32) / float(base_pixels))
-            sigmas = ratios * sigmas / (1 + (ratios - 1) * sigmas)
+                ratios = torch.sqrt(
+                    torch.as_tensor(pixel_counts, device=latents.device, dtype=torch.float32) / float(base_pixels)
+                )
+
+            t_ref = sigmas
+            sigmas = ratios * t_ref / (1 + (ratios - 1) * t_ref)
 
         timesteps = torch.clamp((sigmas * timestep_max).long(), 0, timestep_max)
         _, huber_c = get_timesteps_and_huber_c(

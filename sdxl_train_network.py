@@ -59,14 +59,13 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
     def get_flow_pixel_counts(self, args, batch, latents):
         if (
             getattr(args, "flow_model", False)
-            and args.flow_timestep_distribution == "uniform"
             and args.flow_uniform_shift
             and args.flow_uniform_static_ratio is None
         ):
             target_size = batch.get("target_sizes_hw")
             if target_size is None:
                 raise ValueError(
-                    "Resolution-dependent uniform Rectified Flow shift requires target size information in the batch."
+                    "Resolution-dependent Rectified Flow shift requires target size information in the batch."
                 )
             return (target_size[:, 0] * target_size[:, 1]).to(latents.device, torch.float32)
         return None

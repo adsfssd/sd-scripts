@@ -147,6 +147,7 @@ def train(args):
             args.v_pred_like_loss = None
         if args.flow_use_ot:
             logger.info("Using cosine optimal transport pairing for Rectified Flow batches.")
+        shift_enabled = args.flow_uniform_shift or args.flow_uniform_static_ratio is not None
         if args.flow_timestep_distribution == "logit_normal":
             if args.flow_logit_std <= 0:
                 raise ValueError("`--flow_logit_std` must be positive.")
@@ -156,18 +157,19 @@ def train(args):
             )
         elif args.flow_timestep_distribution == "uniform":
             logger.info("Rectified Flow timesteps sampled uniformly in [0, 1].")
+        else:
+            raise ValueError(f"Unknown Rectified Flow timestep distribution: {args.flow_timestep_distribution}")
+        if shift_enabled:
             if args.flow_uniform_static_ratio is not None:
                 if args.flow_uniform_static_ratio <= 0:
                     raise ValueError("`--flow_uniform_static_ratio` must be positive.")
                 logger.info(
-                    f"Applying uniform timestep shift with static ratio={args.flow_uniform_static_ratio}."
+                    f"Applying Rectified Flow timestep shift with static ratio={args.flow_uniform_static_ratio}."
                 )
-            elif args.flow_uniform_shift:
+            else:
                 logger.info(
-                    f"Applying resolution-dependent uniform timestep shift with base pixels={args.flow_uniform_base_pixels}."
+                    f"Applying resolution-dependent Rectified Flow timestep shift with base pixels={args.flow_uniform_base_pixels}."
                 )
-        else:
-            raise ValueError(f"Unknown Rectified Flow timestep distribution: {args.flow_timestep_distribution}")
 
     if args.contrastive_flow_matching and not (args.v_parameterization or args.flow_model):
         raise ValueError("`--contrastive_flow_matching` requires either v-parameterization or Rectified Flow.")
@@ -750,12 +752,13 @@ def train(args):
                 text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
 
                 needs_dynamic_shift = (
-                    args.flow_model
-                    and args.flow_timestep_distribution == "uniform"
-                    and args.flow_uniform_shift
-                    and args.flow_uniform_static_ratio is None
+                    args.flow_model and args.flow_uniform_shift and args.flow_uniform_static_ratio is None
                 )
                 if needs_dynamic_shift:
+                    if target_size is None:
+                        raise ValueError(
+                            "Resolution-dependent Rectified Flow shift requires target size information in the batch."
+                        )
                     pixel_counts = (target_size[:, 0] * target_size[:, 1]).to(latents.device, torch.float32)
                 else:
                     pixel_counts = None
@@ -1086,7 +1089,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--flow_uniform_shift",
         action="store_true",
-        help="apply resolution-dependent shift to uniform Rectified Flow timesteps (SD3-style) / UniformなRectified Flowタイムステップに解像度依存のシフトを適用する",
+        help="apply resolution-dependent shift to Rectified Flow timesteps (SD3-style) / Rectified Flowタイムステップに解像度依存のシフトを適用する",
     )
     parser.add_argument(
         "--flow_uniform_base_pixels",
@@ -1098,7 +1101,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--flow_uniform_static_ratio",
         type=float,
         default=None,
-        help="use a fixed sqrt(m/n) ratio (e.g. 2.5) for uniform Rectified Flow timestep shift; overrides resolution-based shift / 一定のsqrt(m/n)比率（例:2.5）でUniformなRectified Flowタイムステップをシフトする（解像度依存シフトを上書き）",
+        help="use a fixed sqrt(m/n) ratio (e.g. 2.5) for Rectified Flow timestep shift; overrides resolution-based shift / 一定のsqrt(m/n)比率（例:2.5）でRectified Flowタイムステップをシフトする（解像度依存シフトを上書き）",
     )
     parser.add_argument(
         "--contrastive_flow_matching",
