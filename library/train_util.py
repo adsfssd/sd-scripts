@@ -4878,17 +4878,23 @@ def get_hidden_states_sdxl(
         input_ids2 = input_ids2[non_empty_mask]
 
         # allocate zeros
+        tensor_kwargs = {}
+        if weight_dtype is not None:
+            tensor_kwargs["dtype"] = weight_dtype
         hidden_states1_zeros = torch.zeros(
             (b_size_flat, tokenizer1.model_max_length, text_encoder1.config.hidden_size),
-            device=input_ids1.device
+            device=input_ids1.device,
+            **tensor_kwargs,
         )
         hidden_states2_zeros = torch.zeros(
             (b_size_flat, tokenizer2.model_max_length, text_encoder2.config.hidden_size), 
-            device=input_ids2.device
+            device=input_ids2.device,
+            **tensor_kwargs,
         )
         pool2_zeros = torch.zeros(
             (b_size_flat, text_encoder2.config.projection_dim),
-            device=input_ids2.device
+            device=input_ids2.device,
+            **tensor_kwargs,
         )
 
     # handle the case when we have an empty batch due to rearranging
@@ -4912,6 +4918,12 @@ def get_hidden_states_sdxl(
 
         # reassemble the outputs by copying the computed embeddings into placeholders
         if use_zero_cond_dropout: 
+            if hidden_states1_zeros.dtype != hidden_states1.dtype:
+                hidden_states1_zeros = hidden_states1_zeros.to(hidden_states1.dtype)
+            if hidden_states2_zeros.dtype != hidden_states2.dtype:
+                hidden_states2_zeros = hidden_states2_zeros.to(hidden_states2.dtype)
+            if pool2_zeros.dtype != pool2.dtype:
+                pool2_zeros = pool2_zeros.to(pool2.dtype)
             hidden_states1_zeros[non_empty_mask] = hidden_states1
             hidden_states2_zeros[non_empty_mask] = hidden_states2
             pool2_zeros[non_empty_mask] = pool2
@@ -5286,52 +5298,25 @@ def get_timesteps_and_huber_c(
 
 
 def cosine_optimal_transport(X: torch.Tensor, Y: torch.Tensor, backend: str = "auto"):
-    """
-    Compute optimal transport between two sets of vectors using cosine distance.
+    """Compute an optimal assignment under cosine distance."""
 
-    Parameters:
-        X: torch.Tensor of shape (n, d)
-        Y: torch.Tensor of shape (m, d)
-        backend: 'auto' (default), 'cuda', or 'scipy'
+    X_norm = X / torch.norm(X, dim=1, keepdim=True)
+    Y_norm = Y / torch.norm(Y, dim=1, keepdim=True)
+    cost = -torch.mm(X_norm, Y_norm.t())
 
-    Returns:
-        cost matrix and a tuple of index tensors (row_indices, col_indices)
-    """
-    if X.numel() == 0 or Y.numel() == 0:
-        return torch.empty_like(X @ Y.t()), (
-            torch.empty(0, dtype=torch.long, device=X.device),
-            torch.empty(0, dtype=torch.long, device=Y.device),
-        )
-
-    eps = torch.finfo(X.dtype if X.is_floating_point() else torch.float32).eps
-
-    # Normalize input vectors (avoid division-by-zero/NaNs)
-    X_norms = torch.norm(X, dim=1, keepdim=True).clamp_min(eps)
-    Y_norms = torch.norm(Y, dim=1, keepdim=True).clamp_min(eps)
-    zero_rows_x = (X_norms <= eps).any()
-    zero_rows_y = (Y_norms <= eps).any()
-    if zero_rows_x or zero_rows_y:
-        logger.warning("Zero-norm rows detected in cosine optimal transport inputs; adding epsilon to avoid NaNs.")
-    X_norm = X / X_norms
-    Y_norm = Y / Y_norms
-
-    # Negative cosine similarity because we minimize cost
-    C = -torch.mm(X_norm, Y_norm.t())
-
-    if backend == "scipy":
-        return _scipy_assignment(C)
     if backend == "cuda":
-        return _cuda_assignment(C)
+        return _cuda_assignment(cost)
+    if backend == "scipy":
+        return _scipy_assignment(cost)
 
-    # Auto mode prefers CUDA, falls back to SciPy on failure
     try:
-        return _cuda_assignment(C)
-    except (ImportError, RuntimeError) as e:
-        logger.warning(
-            "CUDA linear assignment not available, falling back to SciPy for optimal transport. "
-            f"Reason: {str(e)}"
-        )
-        return _scipy_assignment(C)
+        return _cuda_assignment(cost)
+    except (ImportError, RuntimeError) as exc:
+        #logger.warning(
+         #   "CUDA linear assignment not available, falling back to SciPy for optimal transport. "
+          #  f"Reason: {exc}"
+        #)
+        return _scipy_assignment(cost)
 
 
 def _cuda_assignment(cost: torch.Tensor):
