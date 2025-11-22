@@ -618,6 +618,8 @@ class BaseDataset(torch.utils.data.Dataset):
         self.width, self.height = (None, None) if resolution is None else resolution
         self.network_multiplier = network_multiplier
         self.debug_dataset = debug_dataset
+        self.log_caption_tag_dropout = False
+        self.log_caption_dropout = False
 
         self.subsets: List[Union[DreamBoothSubset, FineTuningSubset]] = []
 
@@ -737,6 +739,8 @@ class BaseDataset(torch.utils.data.Dataset):
             caption = caption + " " + subset.caption_suffix
 
         # dropoutの決定：tag dropがこのメソッド内にあるのでここで行うのが良い
+        caption_before_dropout = caption
+
         is_drop_out = subset.caption_dropout_rate > 0 and random.random() < subset.caption_dropout_rate
         is_drop_out = (
             is_drop_out
@@ -745,6 +749,10 @@ class BaseDataset(torch.utils.data.Dataset):
         )
 
         if is_drop_out:
+            if self.log_caption_dropout:
+                logger.info(
+                    f"Caption dropout applied. Original caption: \"{caption_before_dropout}\" -> \"\""
+                )
             caption = ""
         else:
             # process wildcards
@@ -776,6 +784,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 caption = caption.split("\n")[0]
 
             if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
+                original_caption = caption
                 fixed_tokens = []
                 flex_tokens = []
                 fixed_suffix_tokens = []
@@ -809,19 +818,46 @@ class BaseDataset(torch.utils.data.Dataset):
                     )
                     flex_tokens = flex_tokens[:tokens_len]
 
-                def dropout_tags(tokens):
+                if not hasattr(self, "_protected_tags"):
+                    self._protected_tags = set()
+                    if hasattr(self, "protected_tags_file") and self.protected_tags_file and os.path.exists(self.protected_tags_file):
+                        logger.info(f"Loading protected tags from {self.protected_tags_file}")
+                        with open(self.protected_tags_file, "r", encoding="utf-8") as f:
+                            self._protected_tags = {line.strip().lower() for line in f if line.strip()}
+                        logger.info(f"Loaded {len(self._protected_tags)} protected tags.")
+
+                log_tag_dropout = self.log_caption_tag_dropout and subset.caption_tag_dropout_rate > 0
+
+                def dropout_tags(tokens, record_details=False):
                     if subset.caption_tag_dropout_rate <= 0:
-                        return tokens
-                    l = []
+                        return tokens, [], []
+                    kept = []
+                    protected_tokens = []
+                    dropped_tokens = []
                     for token in tokens:
-                        if random.random() >= subset.caption_tag_dropout_rate:
-                            l.append(token)
-                    return l
+                        is_protected = token.lower() in self._protected_tags
+                        if is_protected or random.random() >= subset.caption_tag_dropout_rate:
+                            kept.append(token)
+                            if record_details and is_protected:
+                                protected_tokens.append(token)
+                        elif record_details:
+                            dropped_tokens.append(token)
+                    return kept, protected_tokens, dropped_tokens
 
                 if subset.shuffle_caption:
                     random.shuffle(flex_tokens)
 
-                flex_tokens = dropout_tags(flex_tokens)
+                if log_tag_dropout:
+                    before_dropout_tokens = list(flex_tokens)
+                    flex_tokens, protected_tokens, dropped_tokens = dropout_tags(flex_tokens, True)
+                    logger.info("Caption tag dropout details:")
+                    logger.info(f"  Original caption: \"{original_caption}\"")
+                    logger.info(f"  Tokens before dropout: {before_dropout_tokens}")
+                    logger.info(f"  Protected tokens kept: {protected_tokens}")
+                    logger.info(f"  Dropped tokens: {dropped_tokens}")
+                    logger.info(f"  Tokens after dropout: {flex_tokens}")
+                else:
+                    flex_tokens, _, _ = dropout_tags(flex_tokens, False)
 
                 caption = ", ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
 
@@ -3935,6 +3971,22 @@ def add_dataset_arguments(
             type=float,
             default=0.0,
             help="Rate out dropout comma separated tokens(0.0~1.0) / カンマ区切りのタグをdropoutする割合",
+        )
+        parser.add_argument(
+            "--protected_tags_file",
+            type=str,
+            default=None,
+            help="File containing tags to protect from dropout, one tag per line.",
+        )
+        parser.add_argument(
+            "--log_caption_tag_dropout",
+            action="store_true",
+            help="Log detailed information about caption tag dropout, including protected and dropped tokens.",
+        )
+        parser.add_argument(
+            "--log_caption_dropout",
+            action="store_true",
+            help="Log caption-level dropout decisions and the resulting text sent to the model.",
         )
 
     if support_dreambooth:

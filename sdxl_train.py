@@ -272,6 +272,19 @@ def train(args):
     else:
         train_dataset_group = train_util.load_arbitrary_dataset(args, [tokenizer1, tokenizer2])
 
+    if args.protected_tags_file:
+        logger.info("Injecting protected_tags_file into datasets...")
+        for ds in train_dataset_group.datasets:
+            ds.protected_tags_file = args.protected_tags_file
+    if args.log_caption_tag_dropout:
+        logger.info("Enabling caption tag dropout logging for datasets...")
+        for ds in train_dataset_group.datasets:
+            ds.log_caption_tag_dropout = True
+    if args.log_caption_dropout:
+        logger.info("Enabling caption dropout logging for datasets...")
+        for ds in train_dataset_group.datasets:
+            ds.log_caption_dropout = True
+
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
     ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
