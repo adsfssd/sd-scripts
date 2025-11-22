@@ -4169,6 +4169,14 @@ def get_optimizer(args, trainable_params):
         print(f"Using AdamW8Bit with Kahan Summation, remember to give it args!. | {optimizer_kwargs}")
         optimizer_class = AdamW8bitKahan
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+    if optimizer_type == "AdamWBF16".lower():
+        try:
+            from adamw_bf16 import AdamWBF16
+        except ImportError:
+            raise ImportError("AdamWBF16 failed to import")
+        print(f"Using AdamW with Stochastic Rounding. | {optimizer_kwargs}")
+        optimizer_class = AdamWBF16
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
     elif optimizer_type.endswith("8bit".lower()):
         try:

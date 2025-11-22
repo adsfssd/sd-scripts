@@ -49,22 +49,29 @@ from library.sdxl_original_unet import SdxlUNet2DConditionModel
 UNET_NUM_BLOCKS_FOR_BLOCK_LR = 23
 
 
-def get_block_params_to_optimize(unet: SdxlUNet2DConditionModel, block_lrs: List[float]) -> List[dict]:
+def _unet_block_index_from_name(name: str) -> int:
+    if name.startswith("time_embed.") or name.startswith("label_emb."):
+        return 0  # 0
+    if name.startswith("input_blocks."):  # 1-9
+        return 1 + int(name.split(".")[1])
+    if name.startswith("middle_block."):  # 10-12
+        return 10 + int(name.split(".")[1])
+    if name.startswith("output_blocks."):  # 13-21
+        return 13 + int(name.split(".")[1])
+    if name.startswith("out."):  # 22
+        return 22
+    raise ValueError(f"unexpected parameter name: {name}")
+
+
+def get_block_params_to_optimize(
+    unet: SdxlUNet2DConditionModel, block_lrs: List[float], frozen_blocks: set[int] | None = None
+) -> List[dict]:
     block_params = [[] for _ in range(len(block_lrs))]
 
     for i, (name, param) in enumerate(unet.named_parameters()):
-        if name.startswith("time_embed.") or name.startswith("label_emb."):
-            block_index = 0  # 0
-        elif name.startswith("input_blocks."):  # 1-9
-            block_index = 1 + int(name.split(".")[1])
-        elif name.startswith("middle_block."):  # 10-12
-            block_index = 10 + int(name.split(".")[1])
-        elif name.startswith("output_blocks."):  # 13-21
-            block_index = 13 + int(name.split(".")[1])
-        elif name.startswith("out."):  # 22
-            block_index = 22
-        else:
-            raise ValueError(f"unexpected parameter name: {name}")
+        block_index = _unet_block_index_from_name(name)
+        if frozen_blocks and block_index in frozen_blocks:
+            continue
 
         block_params[block_index].append(param)
 
@@ -75,6 +82,30 @@ def get_block_params_to_optimize(unet: SdxlUNet2DConditionModel, block_lrs: List
         params_to_optimize.append({"params": params, "lr": block_lrs[i]})
 
     return params_to_optimize
+
+
+def freeze_unet_blocks(unet: SdxlUNet2DConditionModel, frozen_blocks: set[int]) -> None:
+    """Mark selected U-Net blocks as frozen (no gradients)."""
+
+    if not frozen_blocks:
+        return
+
+    for name, param in unet.named_parameters():
+        block_index = _unet_block_index_from_name(name)
+        if block_index in frozen_blocks:
+            param.requires_grad_(False)
+
+
+def describe_unet_blocks(unet: SdxlUNet2DConditionModel):
+    """Collect a short description of each U-Net block index."""
+
+    info = {}
+    for name, param in unet.named_parameters():
+        block_index = _unet_block_index_from_name(name)
+        if block_index not in info:
+            info[block_index] = {"example": name, "params": 0}
+        info[block_index]["params"] += param.numel()
+    return info
 
 
 def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type):
@@ -117,6 +148,20 @@ def train(args):
         ), f"block_lr must have {UNET_NUM_BLOCKS_FOR_BLOCK_LR} values / block_lrは{UNET_NUM_BLOCKS_FOR_BLOCK_LR}個の値を指定してください"
     else:
         block_lrs = None
+
+    frozen_unet_blocks = set()
+    if args.freeze_unet_blocks:
+        for token in args.freeze_unet_blocks.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                idx = int(token)
+            except ValueError as exc:
+                raise ValueError(f"Invalid U-Net block index '{token}' in --freeze_unet_blocks") from exc
+            if idx < 0 or idx >= UNET_NUM_BLOCKS_FOR_BLOCK_LR:
+                raise ValueError(f"--freeze_unet_blocks indices must be in [0, {UNET_NUM_BLOCKS_FOR_BLOCK_LR - 1}]")
+            frozen_unet_blocks.add(idx)
 
     vae_scale_factor = sdxl_model_util.VAE_SCALE_FACTOR
     vae_shift_factor = 0.0
@@ -275,6 +320,14 @@ def train(args):
         vae = model_util.use_reflection_padding(vae)
     # logit_scale = logit_scale.to(accelerator.device, dtype=weight_dtype)
 
+    if args.list_unet_blocks:
+        block_info = describe_unet_blocks(unet)
+        accelerator.print("SDXL U-Net block mapping (index -> example parameter) and param counts:")
+        for idx in sorted(block_info.keys()):
+            info = block_info[idx]
+            accelerator.print(f"{idx:02d}: {info['example']} (params: {info['params']})")
+        return
+
     # verify load/save model formats
     if load_stable_diffusion_format:
         src_stable_diffusion_ckpt = args.pretrained_model_name_or_path
@@ -382,6 +435,9 @@ def train(args):
         vae.to(accelerator.device, dtype=vae_dtype)
 
     unet.requires_grad_(train_unet)
+    if train_unet and frozen_unet_blocks:
+        accelerator.print(f"Freezing U-Net blocks: {sorted(frozen_unet_blocks)}")
+        freeze_unet_blocks(unet, frozen_unet_blocks)
     if not train_unet:
         unet.to(accelerator.device, dtype=weight_dtype)  # because of unet is not prepared
 
@@ -390,9 +446,10 @@ def train(args):
     if train_unet:
         training_models.append(unet)
         if block_lrs is None:
-            params_to_optimize.append({"params": list(unet.parameters()), "lr": args.learning_rate})
+            trainable_params = [p for p in unet.parameters() if p.requires_grad]
+            params_to_optimize.append({"params": trainable_params, "lr": args.learning_rate})
         else:
-            params_to_optimize.extend(get_block_params_to_optimize(unet, block_lrs))
+            params_to_optimize.extend(get_block_params_to_optimize(unet, block_lrs, frozen_unet_blocks))
 
     if train_text_encoder1:
         training_models.append(text_encoder1)
@@ -1050,6 +1107,17 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"learning rates for each block of U-Net, comma-separated, {UNET_NUM_BLOCKS_FOR_BLOCK_LR} values / "
         + f"U-Netの各ブロックの学習率、カンマ区切り、{UNET_NUM_BLOCKS_FOR_BLOCK_LR}個の値",
+    )
+    parser.add_argument(
+        "--list_unet_blocks",
+        action="store_true",
+        help="print SDXL U-Net block indices with example parameter names, then exit / U-Netブロックの番号とサンプルのパラメータ名を表示して終了",
+    )
+    parser.add_argument(
+        "--freeze_unet_blocks",
+        type=str,
+        default=None,
+        help="comma-separated block indices to freeze in the U-Net (0=time/label embed, 1-9=input, 10-12=middle, 13-21=output, 22=out conv) / U-Net内で学習しないブロック番号を指定（カンマ区切り）",
     )
     parser.add_argument(
         "--fused_optimizer_groups",
