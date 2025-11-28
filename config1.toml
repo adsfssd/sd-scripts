@@ -5,7 +5,7 @@ text_encoder_lr    = 5e-5
 
 
 [optimizer_arguments]
-lr_scheduler       = "constant_with_warmup"
+lr_scheduler       = "REX"
 optimizer_type     = "AdamW8bit"
 optimizer_args     = ["weight_decay=0.01"]
 min_lr             = 0

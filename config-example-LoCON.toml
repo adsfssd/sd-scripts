@@ -1,5 +1,5 @@
 [additional_network_arguments]
-unet_lr            = 3e-4
+unet_lr            = 2e-5 #3e-4 for AdamW8
 text_encoder_lr    = 2e-5
 network_dim        = 32
 network_alpha      = 64
@@ -9,8 +9,8 @@ network_args       = ['conv_dim=24', 'conv_alpha=48.0', 'algo=locon', 'preset=fu
 
 [optimizer_arguments]
 lr_scheduler       = "REX"
-optimizer_type     = "AdamW8bit"
-optimizer_args     = ["weight_decay=0.01"]
+optimizer_type     = "LoraEasyCustomOptimizer.came.CAME"
+optimizer_args     = ["weight_decay=0.05"] #0.01 for AdamW
 min_lr             = 0
 
 [training_arguments]
@@ -20,7 +20,7 @@ loss_type          = "l2"
 save_every_n_epochs = 1
 save_every_n_steps = 20
 save_last_n_epochs  = 5
-train_batch_size   = 4
+train_batch_size   = 12
 max_grad_norm      = 0
 weighted_captions  = false
 seed               = 65867997

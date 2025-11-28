@@ -19,6 +19,7 @@ from typing import (
     Sequence,
     Tuple,
     Union,
+    Callable,
 )
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialState
 import glob
@@ -4540,6 +4541,15 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         initial_lr = float(name.split(":")[1])
         # logger.info(f"adafactor scheduler init lr {initial_lr}")
         return wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr))
+    if name.upper() == "REX":
+        scheduler_steps = num_training_steps - num_warmup_steps
+        lr_lambda = lr_lambda_rex(scheduler_steps, **lr_scheduler_kwargs)
+        if num_warmup_steps > 0:
+            lr_lambda = lr_lambda_warmup(num_warmup_steps, lr_lambda)
+        return torch.optim.lr_scheduler.LambdaLR(
+                optimizer=optimizer,
+                lr_lambda=lr_lambda,
+        )
 
     if name == DiffusersSchedulerType.PIECEWISE_CONSTANT.value:
         name = DiffusersSchedulerType(name)
@@ -4597,15 +4607,6 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             num_warmup_steps=num_warmup_steps,
             num_training_steps=num_training_steps,
             **lr_scheduler_kwargs,
-        )
-    if name.upper() == "REX":
-        scheduler_steps = num_training_steps - num_warmup_steps
-        lr_lambda = lr_lambda_rex(scheduler_steps, **lr_scheduler_kwargs)
-        if num_warmup_steps > 0:
-            lr_lambda = lr_lambda_warmup(num_warmup_steps, lr_lambda)
-        return torch.optim.lr_scheduler.LambdaLR(
-                optimizer=optimizer,
-                lr_lambda=lr_lambda,
         )
 
     # All other schedulers require `num_decay_steps`
