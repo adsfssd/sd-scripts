@@ -32,10 +32,10 @@ save_precision     = "bf16"
 mixed_precision    = "bf16"
 full_bf16          = true
 output_dir         = "/home/bluvoll/stable-diffusion-webui-reForge/models/Lora/"
-output_name        = "NoobAI-RF-0.5TEST-AT"
+output_name        = "Rebis-TEST-AT"
 
 [model_arguments]
-pretrained_model_name_or_path = "/home/bluvoll/Descargas/NoobAI-RF-v0.5.safetensors"
+pretrained_model_name_or_path = "/home/bluvoll/Descargas/NoobAI-RF-v0.2-Base.safetensors"
 v2                    = false
 sdxl                  = true
 gradient_checkpointing = true
