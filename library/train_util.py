@@ -2584,7 +2584,7 @@ class ThreadedPrefetcher:
     def __init__(self):
         self._in_queue = queue.Queue(1)
         self._out_queue = queue.Queue(1)
-        self._worker = threading.Thread(target=self._worker_fun, args=(self._in_queue, self._out_queue))
+        self._worker = threading.Thread(target=self._worker_fun, args=(self._in_queue, self._out_queue), daemon=True)
         self._worker.start()
 
     def _worker_fun(self, _in_queue, _out_queue):
@@ -2604,6 +2604,23 @@ class ThreadedPrefetcher:
     def __del__(self):
         if self._worker.is_alive():
             self._worker.join(1.0)
+
+
+class CUDAStreamPrefetcher:
+    def __init__(self, *args, **kwargs):
+        self.stream = torch.cuda.Stream(*args, **kwargs)
+        self.current_result = None
+        
+    def next_batch(self, fn, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        
+        with torch.cuda.stream(self.stream):
+            self.current_result = fn(*args, **kwargs)
+    
+    def current_batch(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+        return self.current_result
 
 
 def cache_batch_latents(

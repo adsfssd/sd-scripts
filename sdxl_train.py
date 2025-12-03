@@ -624,13 +624,14 @@ def train(args):
     if not args.train_text_encoder:
         if args.text_encoder_device != "auto":
             te_device = args.text_encoder_device
-            print(f"moving text encoders to {te_device} and compiling them")
+            print(f"moving text encoders to {te_device}")
             if te_device == "cpu":
                 text_encoder1.to(te_device, dtype=torch.float32)
                 text_encoder2.to(te_device, dtype=torch.float32)
             else:
                 text_encoder1.to(te_device)
                 text_encoder2.to(te_device)
+            print("compiling text encoders")
             text_encoder1 = torch.compile(text_encoder1)
             text_encoder2 = torch.compile(text_encoder2)
             clean_memory_on_device(accelerator.device)
@@ -743,7 +744,9 @@ def train(args):
         accelerator, args, 0, global_step, accelerator.device, vae, [tokenizer1, tokenizer2], [text_encoder1, text_encoder2], unet
     )
 
-    other_data_prefetcher = train_util.ThreadedPrefetcher()
+    # other_data_prefetcher = train_util.ThreadedPrefetcher()
+    other_data_prefetcher = train_util.CUDAStreamPrefetcher()
+    te_prefetcher = train_util.ThreadedPrefetcher()
 
     def get_te_args(batch):
         input_ids1 = batch["input_ids"]
@@ -761,8 +764,8 @@ def train(args):
             None if not args.full_fp16 else weight_dtype,
             accelerator,
         )
-    
-    def get_other_data(step, batch):
+
+    def get_te_outputs(step, batch):
         if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
             with torch.set_grad_enabled(args.train_text_encoder):
                 # Get the text embedding for conditioning
@@ -814,6 +817,19 @@ def train(args):
             # assert ((pool2.to("cpu") - p2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
             # logger.info("text encoder outputs verified")
 
+        # get size embeddings
+        orig_size = batch["original_sizes_hw"]
+        crop_size = batch["crop_top_lefts"]
+        target_size = batch["target_sizes_hw"]
+        embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
+
+        # concat embeddings
+        vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
+        text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+
+        return vector_embedding, text_embedding
+
+    def get_other_data(step, batch):
         if "latents" in batch and batch["latents"] is not None:
             latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
         else:
@@ -829,16 +845,6 @@ def train(args):
         if args.vae_shift_factor != 0.0:
             latents = latents - args.vae_shift_factor
         latents = latents * args.vae_scale_factor
-
-        # get size embeddings
-        orig_size = batch["original_sizes_hw"]
-        crop_size = batch["crop_top_lefts"]
-        target_size = batch["target_sizes_hw"]
-        embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
-
-        # concat embeddings
-        vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
-        text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
 
         needs_dynamic_shift = (
             args.flow_model and args.flow_uniform_shift and args.flow_uniform_static_ratio is None
@@ -867,7 +873,7 @@ def train(args):
         else:
             target = noise
 
-        return latents, vector_embedding, text_embedding, pixel_counts, noise, noisy_latents, timesteps, huber_c, target
+        return latents, pixel_counts, noise, noisy_latents, timesteps, huber_c, target
 
         
     loss_recorder = train_util.LossRecorder()
@@ -903,13 +909,20 @@ def train(args):
                 # on n-th step, we want to retreive the batch we have processed
                 # and prefetch the next batch for processing
                 # on the very last step, we only want to retreive the precomputed batch and not anything else
-                if step == 0:
-                    other_data_prefetcher.next_batch(get_other_data, args=(step, batch,))
-                    
-                latents, vector_embedding, text_embedding, pixel_counts, noise, noisy_latents, timesteps, huber_c, target = other_data_prefetcher.current_batch()
 
+                # text encoder
+                if step == 0:
+                    te_prefetcher.next_batch(get_te_outputs, args=(step, batch,))
+                vector_embedding, text_embedding = te_prefetcher.current_batch()
                 if next_batch is not None:
-                    other_data_prefetcher.next_batch(get_other_data, args=(step + 1, next_batch,))
+                    te_prefetcher.next_batch(get_te_outputs, args=(step + 1, batch,))
+
+                # stuff
+                if step == 0:
+                    other_data_prefetcher.next_batch(get_other_data, args=(step, batch))
+                latents, pixel_counts, noise, noisy_latents, timesteps, huber_c, target = other_data_prefetcher.current_batch()
+                if next_batch is not None:
+                    other_data_prefetcher.next_batch(get_other_data, args=(step + 1, next_batch))
                 
                 # Predict the noise residual
                 with accelerator.autocast():
