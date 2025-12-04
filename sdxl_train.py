@@ -3,6 +3,7 @@
 import argparse
 import math
 import os
+import itertools
 from multiprocessing import Value
 from typing import List
 import toml
@@ -620,6 +621,21 @@ def train(args):
         text_encoder1.to(accelerator.device)
         text_encoder2.to(accelerator.device)
 
+    if not args.train_text_encoder:
+        if args.text_encoder_device != "auto":
+            te_device = args.text_encoder_device
+            print(f"moving text encoders to {te_device}")
+            if te_device == "cpu":
+                text_encoder1.to(te_device, dtype=torch.float32)
+                text_encoder2.to(te_device, dtype=torch.float32)
+            else:
+                text_encoder1.to(te_device)
+                text_encoder2.to(te_device)
+            print("compiling text encoders")
+            text_encoder1 = torch.compile(text_encoder1)
+            text_encoder2 = torch.compile(text_encoder2)
+            clean_memory_on_device(accelerator.device)
+
     # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
     if args.full_fp16:
         # During deepseed training, accelerate not handles fp16/bf16|mixed precision directly via scaler. Let deepspeed engine do.
@@ -728,6 +744,139 @@ def train(args):
         accelerator, args, 0, global_step, accelerator.device, vae, [tokenizer1, tokenizer2], [text_encoder1, text_encoder2], unet
     )
 
+    # other_data_prefetcher = train_util.ThreadedPrefetcher()
+    other_data_prefetcher = train_util.CUDAStreamPrefetcher()
+    te_prefetcher = train_util.ThreadedPrefetcher()
+    # te_prefetcher = train_util.CUDAStreamPrefetcher()
+
+    def get_te_args(batch):
+        input_ids1 = batch["input_ids"]
+        input_ids2 = batch["input_ids2"]
+
+        return (
+            args.max_token_length,
+            args.use_zero_cond_dropout,
+            input_ids1.to(text_encoder1.device),
+            input_ids2.to(text_encoder2.device),
+            tokenizer1,
+            tokenizer2,
+            text_encoder1,
+            text_encoder2,
+            None if not args.full_fp16 else weight_dtype,
+            accelerator,
+        )
+
+    def get_te_outputs(step, batch):
+        if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
+            with torch.set_grad_enabled(args.train_text_encoder):
+                # Get the text embedding for conditioning
+                # TODO support weighted captions
+                # if args.weighted_captions:
+                #     encoder_hidden_states = get_weighted_text_embeddings(
+                #         tokenizer,
+                #         text_encoder,
+                #         batch["captions"],
+                #         accelerator.device,
+                #         args.max_token_length // 75 if args.max_token_length else 1,
+                #         clip_skip=args.clip_skip,
+                #     )
+                # else:
+                # unwrap_model is fine for models not wrapped by accelerator
+                input_ids1 = batch["input_ids"]
+                input_ids2 = batch["input_ids2"]
+                encoder_hidden_states1, encoder_hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
+                    args.max_token_length,
+                    args.use_zero_cond_dropout,
+                    input_ids1.to(text_encoder1.device),
+                    input_ids2.to(text_encoder2.device),
+                    tokenizer1,
+                    tokenizer2,
+                    text_encoder1,
+                    text_encoder2,
+                    None if not args.full_fp16 else weight_dtype,
+                    accelerator=accelerator,
+                )
+        else:
+            encoder_hidden_states1 = batch["text_encoder_outputs1_list"]
+            encoder_hidden_states2 = batch["text_encoder_outputs2_list"]
+            pool2 = batch["text_encoder_pool2_list"]
+
+            # # verify that the text encoder outputs are correct
+            # ehs1, ehs2, p2 = train_util.get_hidden_states_sdxl(
+            #     args.max_token_length,
+            #     batch["input_ids"].to(text_encoder1.device),
+            #     batch["input_ids2"].to(text_encoder1.device),
+            #     tokenizer1,
+            #     tokenizer2,
+            #     text_encoder1,
+            #     text_encoder2,
+            #     None if not args.full_fp16 else weight_dtype,
+            # )
+            # b_size = encoder_hidden_states1.shape[0]
+            # assert ((encoder_hidden_states1.to("cpu") - ehs1.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
+            # assert ((encoder_hidden_states2.to("cpu") - ehs2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
+            # assert ((pool2.to("cpu") - p2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
+            # logger.info("text encoder outputs verified")
+
+        # get size embeddings
+        orig_size = batch["original_sizes_hw"]
+        crop_size = batch["crop_top_lefts"]
+        target_size = batch["target_sizes_hw"]
+        embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, text_encoder1.device)
+
+        # concat embeddings
+        vector_embedding = torch.cat([pool2, embs], dim=1)
+        text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2)
+
+        return vector_embedding.pin_memory(), text_embedding.pin_memory()
+
+    def get_other_data(step, batch):
+        if "latents" in batch and batch["latents"] is not None:
+            latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
+        else:
+            with torch.no_grad():
+                # latentに変換
+                latents = vae.encode(batch["images"].to(vae_dtype)).latent_dist.sample().to(weight_dtype)
+
+                # NaNが含まれていれば警告を表示し0に置き換える
+                if torch.any(torch.isnan(latents)):
+                    accelerator.print("NaN found in latents, replacing with zeros")
+                    latents = torch.nan_to_num(latents, 0, out=latents)
+
+        if args.vae_shift_factor != 0.0:
+            latents = latents - args.vae_shift_factor
+        latents = latents * args.vae_scale_factor
+
+        needs_dynamic_shift = (
+            args.flow_model and args.flow_uniform_shift and args.flow_uniform_static_ratio is None
+        )
+        if needs_dynamic_shift:
+            if target_size is None:
+                raise ValueError(
+                    "Resolution-dependent Rectified Flow shift requires target size information in the batch."
+                )
+            pixel_counts = (target_size[:, 0] * target_size[:, 1]).to(latents.device, torch.float32)
+        else:
+            pixel_counts = None
+
+        # Sample noise, sample a random timestep for each image, and add noise to the latents,
+        # with noise offset and/or multires noise if specified
+        noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
+            args, noise_scheduler, latents, pixel_counts=pixel_counts
+        )
+
+        noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
+
+        if args.flow_model:
+            target = noise - latents
+        elif args.v_parameterization:
+            target = noise_scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            target = noise
+
+        return latents, pixel_counts, noise, noisy_latents, timesteps, huber_c, target
+
+        
     loss_recorder = train_util.LossRecorder()
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
@@ -736,121 +885,52 @@ def train(args):
         for m in training_models:
             m.train()
 
-        for step, batch in enumerate(train_dataloader):
+        train_dataloader_iter = iter(train_dataloader)
+        for step in range(len(train_dataloader)):
             current_step.value = global_step
 
+            batch = next(train_dataloader_iter)
+
+            # try to get next batch if available...
+            next_batch = None
+            try:
+                next_batch = next(train_dataloader_iter)
+                # put the batch "back" into the train dataloder
+                train_dataloader_iter = itertools.chain([next_batch], train_dataloader_iter)
+            except StopIteration:
+                pass
+                            
             if args.fused_optimizer_groups:
                 optimizer_hooked_count = {i: 0 for i in range(len(optimizers))}  # reset counter for each step
 
             with accelerator.accumulate(*training_models):
-                if "latents" in batch and batch["latents"] is not None:
-                    latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
-                else:
-                    with torch.no_grad():
-                        # latentに変換
-                        latents = vae.encode(batch["images"].to(vae_dtype)).latent_dist.sample().to(weight_dtype)
 
-                        # NaNが含まれていれば警告を表示し0に置き換える
-                        if torch.any(torch.isnan(latents)):
-                            accelerator.print("NaN found in latents, replacing with zeros")
-                            latents = torch.nan_to_num(latents, 0, out=latents)
-                if args.vae_shift_factor != 0.0:
-                    latents = latents - args.vae_shift_factor
-                latents = latents * args.vae_scale_factor
+                # on the very first step, we want to process the first batch
+                # and prefetch the second batch for processing
+                # on n-th step, we want to retreive the batch we have processed
+                # and prefetch the next batch for processing
+                # on the very last step, we only want to retreive the precomputed batch and not anything else
 
-                if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
-                    input_ids1 = batch["input_ids"]
-                    input_ids2 = batch["input_ids2"]
-                    with torch.set_grad_enabled(args.train_text_encoder):
-                        # Get the text embedding for conditioning
-                        # TODO support weighted captions
-                        # if args.weighted_captions:
-                        #     encoder_hidden_states = get_weighted_text_embeddings(
-                        #         tokenizer,
-                        #         text_encoder,
-                        #         batch["captions"],
-                        #         accelerator.device,
-                        #         args.max_token_length // 75 if args.max_token_length else 1,
-                        #         clip_skip=args.clip_skip,
-                        #     )
-                        # else:
-                        input_ids1 = input_ids1.to(accelerator.device)
-                        input_ids2 = input_ids2.to(accelerator.device)
-                        # unwrap_model is fine for models not wrapped by accelerator
-                        encoder_hidden_states1, encoder_hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
-                            args.max_token_length,
-                            args.use_zero_cond_dropout,
-                            input_ids1,
-                            input_ids2,
-                            tokenizer1,
-                            tokenizer2,
-                            text_encoder1,
-                            text_encoder2,
-                            None if not args.full_fp16 else weight_dtype,
-                            accelerator=accelerator,
-                        )
-                else:
-                    encoder_hidden_states1 = batch["text_encoder_outputs1_list"].to(accelerator.device).to(weight_dtype)
-                    encoder_hidden_states2 = batch["text_encoder_outputs2_list"].to(accelerator.device).to(weight_dtype)
-                    pool2 = batch["text_encoder_pool2_list"].to(accelerator.device).to(weight_dtype)
+                # text encoder
+                if step == 0:
+                    te_prefetcher.next_batch(get_te_outputs, args=(step, batch,))
+                vector_embedding, text_embedding = te_prefetcher.current_batch()
+                if next_batch is not None:
+                    te_prefetcher.next_batch(get_te_outputs, args=(step + 1, batch,))
 
-                    # # verify that the text encoder outputs are correct
-                    # ehs1, ehs2, p2 = train_util.get_hidden_states_sdxl(
-                    #     args.max_token_length,
-                    #     batch["input_ids"].to(text_encoder1.device),
-                    #     batch["input_ids2"].to(text_encoder1.device),
-                    #     tokenizer1,
-                    #     tokenizer2,
-                    #     text_encoder1,
-                    #     text_encoder2,
-                    #     None if not args.full_fp16 else weight_dtype,
-                    # )
-                    # b_size = encoder_hidden_states1.shape[0]
-                    # assert ((encoder_hidden_states1.to("cpu") - ehs1.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
-                    # assert ((encoder_hidden_states2.to("cpu") - ehs2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
-                    # assert ((pool2.to("cpu") - p2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
-                    # logger.info("text encoder outputs verified")
+                vector_embedding = vector_embedding.to(dtype=weight_dtype).to(accelerator.device)
+                text_embedding = text_embedding.to(dtype=weight_dtype).to(accelerator.device)
 
-                # get size embeddings
-                orig_size = batch["original_sizes_hw"]
-                crop_size = batch["crop_top_lefts"]
-                target_size = batch["target_sizes_hw"]
-                embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
-
-                # concat embeddings
-                vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
-                text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
-
-                needs_dynamic_shift = (
-                    args.flow_model and args.flow_uniform_shift and args.flow_uniform_static_ratio is None
-                )
-                if needs_dynamic_shift:
-                    if target_size is None:
-                        raise ValueError(
-                            "Resolution-dependent Rectified Flow shift requires target size information in the batch."
-                        )
-                    pixel_counts = (target_size[:, 0] * target_size[:, 1]).to(latents.device, torch.float32)
-                else:
-                    pixel_counts = None
-
-                # Sample noise, sample a random timestep for each image, and add noise to the latents,
-                # with noise offset and/or multires noise if specified
-                noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
-                    args, noise_scheduler, latents, pixel_counts=pixel_counts
-                )
-
-                noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
-
+                # stuff
+                if step == 0:
+                    other_data_prefetcher.next_batch(get_other_data, args=(step, batch))
+                latents, pixel_counts, noise, noisy_latents, timesteps, huber_c, target = other_data_prefetcher.current_batch()
+                if next_batch is not None:
+                    other_data_prefetcher.next_batch(get_other_data, args=(step + 1, next_batch))
+                
                 # Predict the noise residual
                 with accelerator.autocast():
                     noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
-
-                if args.flow_model:
-                    target = noise - latents
-                elif args.v_parameterization:
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    target = noise
 
                 if (
                     args.min_snr_gamma
@@ -1200,6 +1280,18 @@ def setup_parser() -> argparse.ArgumentParser:
         type=bool,
         default=False,
         help="For full caption dropout, use zero conditioning instead of empty caption"
+    )
+    parser.add_argument(
+        "--use_brown_noise",
+        action="store_true",
+        default=False,
+        help="Replace Gaussian noise with Brown noise."
+    )
+    parser.add_argument(
+        "--text_encoder_device",
+        type=str,
+        default="auto",
+        help="Select the device to move text encoder to. Only effective if text encoder is not trained.",
     )
     return parser
 
