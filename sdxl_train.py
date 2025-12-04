@@ -747,6 +747,7 @@ def train(args):
     # other_data_prefetcher = train_util.ThreadedPrefetcher()
     other_data_prefetcher = train_util.CUDAStreamPrefetcher()
     te_prefetcher = train_util.ThreadedPrefetcher()
+    # te_prefetcher = train_util.CUDAStreamPrefetcher()
 
     def get_te_args(batch):
         input_ids1 = batch["input_ids"]
@@ -783,7 +784,7 @@ def train(args):
                 # unwrap_model is fine for models not wrapped by accelerator
                 input_ids1 = batch["input_ids"]
                 input_ids2 = batch["input_ids2"]
-                encoder_hidden_states1, encoder_hidden_states2, pool2 = [t.to(accelerator.device, non_blocking=True) for t in train_util.get_hidden_states_sdxl(
+                encoder_hidden_states1, encoder_hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
                     args.max_token_length,
                     args.use_zero_cond_dropout,
                     input_ids1.to(text_encoder1.device),
@@ -794,11 +795,11 @@ def train(args):
                     text_encoder2,
                     None if not args.full_fp16 else weight_dtype,
                     accelerator=accelerator,
-                )]
+                )
         else:
-            encoder_hidden_states1 = batch["text_encoder_outputs1_list"].to(accelerator.device).to(weight_dtype)
-            encoder_hidden_states2 = batch["text_encoder_outputs2_list"].to(accelerator.device).to(weight_dtype)
-            pool2 = batch["text_encoder_pool2_list"].to(accelerator.device).to(weight_dtype)
+            encoder_hidden_states1 = batch["text_encoder_outputs1_list"]
+            encoder_hidden_states2 = batch["text_encoder_outputs2_list"]
+            pool2 = batch["text_encoder_pool2_list"]
 
             # # verify that the text encoder outputs are correct
             # ehs1, ehs2, p2 = train_util.get_hidden_states_sdxl(
@@ -821,13 +822,13 @@ def train(args):
         orig_size = batch["original_sizes_hw"]
         crop_size = batch["crop_top_lefts"]
         target_size = batch["target_sizes_hw"]
-        embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
+        embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, text_encoder1.device)
 
         # concat embeddings
-        vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
-        text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+        vector_embedding = torch.cat([pool2, embs], dim=1)
+        text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2)
 
-        return vector_embedding, text_embedding
+        return vector_embedding.pin_memory(), text_embedding.pin_memory()
 
     def get_other_data(step, batch):
         if "latents" in batch and batch["latents"] is not None:
@@ -916,6 +917,9 @@ def train(args):
                 vector_embedding, text_embedding = te_prefetcher.current_batch()
                 if next_batch is not None:
                     te_prefetcher.next_batch(get_te_outputs, args=(step + 1, batch,))
+
+                vector_embedding = vector_embedding.to(dtype=weight_dtype).to(accelerator.device)
+                text_embedding = text_embedding.to(dtype=weight_dtype).to(accelerator.device)
 
                 # stuff
                 if step == 0:
