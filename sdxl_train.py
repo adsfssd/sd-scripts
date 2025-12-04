@@ -63,6 +63,19 @@ def _unet_block_index_from_name(name: str) -> int:
     raise ValueError(f"unexpected parameter name: {name}")
 
 
+def _unet_block_prefix_from_name(name: str) -> str:
+    if name.startswith("time_embed.") or name.startswith("label_emb."):
+        return name.split(".")[0]
+    if name.startswith("input_blocks.") or name.startswith("output_blocks.") or name.startswith("middle_block."):
+        parts = name.split(".")
+        if len(parts) < 2:
+            raise ValueError(f"unexpected block format: {name}")
+        return ".".join(parts[:2])
+    if name.startswith("out."):
+        return name.split(".")[0]
+    raise ValueError(f"unexpected parameter name: {name}")
+
+
 def get_block_params_to_optimize(
     unet: SdxlUNet2DConditionModel, block_lrs: List[float], frozen_blocks: set[int] | None = None
 ) -> List[dict]:
@@ -102,9 +115,31 @@ def describe_unet_blocks(unet: SdxlUNet2DConditionModel):
     info = {}
     for name, param in unet.named_parameters():
         block_index = _unet_block_index_from_name(name)
-        if block_index not in info:
-            info[block_index] = {"example": name, "params": 0}
-        info[block_index]["params"] += param.numel()
+        block_prefix = _unet_block_prefix_from_name(name)
+        block_entry = info.setdefault(block_index, {"example": name, "params": 0, "layers": set()})
+        block_entry["params"] += param.numel()
+
+        layer_path = name.rsplit(".", 1)[0]  # strip parameter name
+        suffix = ""
+        if layer_path == block_prefix:
+            suffix = ""
+        elif layer_path.startswith(f"{block_prefix}."):
+            suffix = layer_path[len(block_prefix) + 1 :]
+        else:
+            suffix = layer_path
+
+        if suffix:
+            tokens = [token for token in suffix.split(".") if token]
+            while tokens and tokens[0].isdigit():
+                tokens.pop(0)
+            layer_name = ".".join(tokens) if tokens else block_prefix
+        else:
+            layer_name = block_prefix
+
+        block_entry["layers"].add(layer_name)
+
+    for entry in info.values():
+        entry["layers"] = sorted(entry["layers"])
     return info
 
 
@@ -335,10 +370,12 @@ def train(args):
 
     if args.list_unet_blocks:
         block_info = describe_unet_blocks(unet)
-        accelerator.print("SDXL U-Net block mapping (index -> example parameter) and param counts:")
+        accelerator.print("SDXL U-Net block mapping (index -> example parameter) with param counts and layers:")
         for idx in sorted(block_info.keys()):
             info = block_info[idx]
-            accelerator.print(f"{idx:02d}: {info['example']} (params: {info['params']})")
+            layers = ", ".join(info.get("layers", [])) or "-"
+            accelerator.print(f"{idx:02d}: {info['example']} (params: {info['params']:,})")
+            accelerator.print(f"    layers: {layers}")
         return
 
     # verify load/save model formats
@@ -1113,6 +1150,11 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="apply a constant latent shift before scaling (e.g. Flux-style offset) / スケーリング前に潜在表現へ定数シフトを適用する",
+    )
+    parser.add_argument(
+        "--disable_cross_attn_mask",
+        action="store_true",
+        help="disable SDXL cross-attention masking so padded tokens are treated as normal tokens / SDXLのcross-attentionマスク処理を無効化する",
     )
     parser.add_argument(
         "--block_lr",
