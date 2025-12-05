@@ -568,29 +568,6 @@ def train(args):
     else:
         _, _, optimizer = train_util.get_optimizer(args, trainable_params=params_to_optimize)
 
-    # dataloaderを準備する
-    # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
-    n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset_group,
-        batch_size=1,
-        shuffle=True,
-        collate_fn=collator,
-        num_workers=n_workers,
-        persistent_workers=args.persistent_data_loader_workers,
-    )
-
-    # 学習ステップ数を計算する
-    if args.max_train_epochs is not None:
-        args.max_train_steps = args.max_train_epochs * math.ceil(
-            len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
-        )
-        accelerator.print(
-            f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}"
-        )
-
-    # データセット側にも学習ステップを送信
-    train_dataset_group.set_max_train_steps(args.max_train_steps)
 
     # lr schedulerを用意する
     if args.fused_optimizer_groups:
@@ -638,6 +615,30 @@ def train(args):
         # make sure Text Encoders are on GPU
         text_encoder1.to(accelerator.device)
         text_encoder2.to(accelerator.device)
+
+    # dataloaderを準備する
+    # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
+    n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset_group,
+        batch_size=1,
+        shuffle=True,
+        collate_fn=collator,
+        num_workers=n_workers,
+        persistent_workers=args.persistent_data_loader_workers,
+    )
+
+    # 学習ステップ数を計算する
+    if args.max_train_epochs is not None:
+        args.max_train_steps = args.max_train_epochs * math.ceil(
+            len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
+        )
+        accelerator.print(
+            f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}"
+        )
+
+    # データセット側にも学習ステップを送信
+    train_dataset_group.set_max_train_steps(args.max_train_steps)
 
     if args.deepspeed:
         ds_model = deepspeed_utils.prepare_deepspeed_model(
