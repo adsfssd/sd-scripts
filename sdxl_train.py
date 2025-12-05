@@ -623,6 +623,22 @@ def train(args):
         text_encoder1.text_model.encoder.layers[-1].requires_grad_(False)
         text_encoder1.text_model.final_layer_norm.requires_grad_(False)
 
+    # TextEncoderの出力をキャッシュするときにはCPUへ移動する
+    if args.cache_text_encoder_outputs:
+        # move Text Encoders for sampling images. Text Encoder doesn't work on CPU with fp16
+        text_encoder1.to("cpu", dtype=torch.float32)
+        text_encoder2.to("cpu", dtype=torch.float32)
+        clean_memory_on_device(accelerator.device)
+    elif args.text_encoder_device != "auto":
+        if args.text_encoder_devoce == "cpu":
+            text_encoder1.to("cpu", dtype=torch.float32)
+            text_encoder2.to("cpu", dtype=torch.float32)
+            clean_memory_on_device(accelerator.device)
+    else:    
+        # make sure Text Encoders are on GPU
+        text_encoder1.to(accelerator.device)
+        text_encoder2.to(accelerator.device)
+
     if args.deepspeed:
         ds_model = deepspeed_utils.prepare_deepspeed_model(
             args,
@@ -645,17 +661,6 @@ def train(args):
         if train_text_encoder2:
             text_encoder2 = accelerator.prepare(text_encoder2)
         optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
-
-    # TextEncoderの出力をキャッシュするときにはCPUへ移動する
-    if args.cache_text_encoder_outputs:
-        # move Text Encoders for sampling images. Text Encoder doesn't work on CPU with fp16
-        text_encoder1.to("cpu", dtype=torch.float32)
-        text_encoder2.to("cpu", dtype=torch.float32)
-        clean_memory_on_device(accelerator.device)
-    else:
-        # make sure Text Encoders are on GPU
-        text_encoder1.to(accelerator.device)
-        text_encoder2.to(accelerator.device)
 
     # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
     if args.full_fp16:
@@ -1242,6 +1247,12 @@ def setup_parser() -> argparse.ArgumentParser:
         type=bool,
         default=False,
         help="For full caption dropout, use zero conditioning instead of empty caption"
+    )
+    parser.add_argument(
+        "--text_encoder_device",
+        type=str,
+        default="auto",
+        help="Select the device to move text encoder to. Only effective if text encoder is not trained.",
     )
     return parser
 
