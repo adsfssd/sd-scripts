@@ -816,8 +816,8 @@ def train(args):
                         #         clip_skip=args.clip_skip,
                         #     )
                         # else:
-                        input_ids1 = input_ids1.to(accelerator.device)
-                        input_ids2 = input_ids2.to(accelerator.device)
+                        input_ids1 = input_ids1.to(text_encoder1.device)
+                        input_ids2 = input_ids2.to(text_encoder2.device)
                         # unwrap_model is fine for models not wrapped by accelerator
                         encoder_hidden_states1, encoder_hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
                             args.max_token_length,
