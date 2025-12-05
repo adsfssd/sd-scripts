@@ -2517,6 +2517,78 @@ class MinimalDataset(BaseDataset):
         raise NotImplementedError
 
 
+
+class OnlineTEDatasetWrapper(torch.utils.data.Dataset):
+    def __init__(self, dataset, text_encoder1, text_encoder2, tokenizer1, tokenizer2, args, weight_dtype):
+        super().__init__()
+
+        self._dataset = dataset
+        self._text_encoder1 = text_encoder1
+        self._text_encoder2 = text_encoder2
+        self._tokenizer1 = tokenizer1
+        self._tokenizer2 = tokenizer2
+
+        self._args = args
+        self._weight_dtype = weight_dtype
+
+    @staticmethod
+    def worker_init_fn(worker_id):
+        # pytorch sets number of threads to 1 by default for dataloader processes
+        num_workers = torch.utils.data.get_worker_info().num_workers
+        torch.set_num_threads(os.cpu_count() // (2 * num_workers))
+        
+    def __len__(self):
+        return len(self._dataset)
+
+    def __getitem__(self, index):
+        batch = self._dataset[index]
+        batch = self.update_batch(batch)
+        return batch
+
+    def update_batch(self, batch):
+        if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
+            input_ids1 = batch["input_ids"]
+            input_ids2 = batch["input_ids2"]
+            with torch.inference_mode():
+                input_ids1 = input_ids1.to(self._text_encoder1.device)
+                input_ids2 = input_ids2.to(self._text_encoder2.device)
+                # unwrap_model is fine for models not wrapped by accelerator
+                encoder_hidden_states1, encoder_hidden_states2, pool2 = get_hidden_states_sdxl(
+                    self._args.max_token_length,
+                    self._args.use_zero_cond_dropout,
+                    input_ids1,
+                    input_ids2,
+                    self._tokenizer1,
+                    self._tokenizer2,
+                    self._text_encoder1,
+                    self._text_encoder2,
+                    None if not self._args.full_fp16 else self._weight_dtype,
+                    accelerator=None,
+                )
+        
+            batch["text_encoder_outputs1_list"] = encoder_hidden_states1.to(self._weight_dtype).cpu()
+            batch["text_encoder_outputs2_list"] = encoder_hidden_states2.to(self._weight_dtype).cpu()
+            batch["text_encoder_pool2_list"] = pool2.to(self._weight_dtype).cpu()
+        return batch
+    
+    def set_max_train_steps(self, *args):
+        return self._dataset.set_max_train_steps(*args)
+
+    def set_current_epoch(self, *args):
+        return self._dataset.set_current_epoch(*args)
+
+    def set_current_step(self, *args):
+        return self._dataset.set_current_step(*args)
+
+    @property
+    def num_train_images(self):
+        return self._dataset.num_train_images
+
+    @property
+    def datasets(self):
+        return self._dataset.datasets
+
+
 def load_arbitrary_dataset(args, tokenizer) -> MinimalDataset:
     module = ".".join(args.dataset_class.split(".")[:-1])
     dataset_class = args.dataset_class.split(".")[-1]

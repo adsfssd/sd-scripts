@@ -607,15 +607,31 @@ def train(args):
         text_encoder2.to("cpu", dtype=torch.float32)
         clean_memory_on_device(accelerator.device)
     elif args.text_encoder_device != "auto":
-        if args.text_encoder_devoce == "cpu":
+        if args.text_encoder_device == "cpu":
             text_encoder1.to("cpu", dtype=torch.float32)
             text_encoder2.to("cpu", dtype=torch.float32)
+            clean_memory_on_device(accelerator.device)
+        else:
+            text_encoder1.to(args.text_encoder_device)
+            text_encoder2.to(args.text_encoder_device)
             clean_memory_on_device(accelerator.device)
     else:    
         # make sure Text Encoders are on GPU
         text_encoder1.to(accelerator.device)
         text_encoder2.to(accelerator.device)
 
+    if args.text_encoder_device != "auto" and not args.train_text_encoder:
+        accelerator.print("wrapping train_dataset_group")
+        train_dataset_group = train_util.OnlineTEDatasetWrapper(
+            train_dataset_group,
+            text_encoder1,
+            text_encoder2,
+            tokenizer1,
+            tokenizer2,
+            args,
+            weight_dtype,
+        )
+    
     # dataloaderを準備する
     # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
     n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
@@ -626,6 +642,7 @@ def train(args):
         collate_fn=collator,
         num_workers=n_workers,
         persistent_workers=args.persistent_data_loader_workers,
+        worker_init_fn=train_dataset_group.worker_init_fn if isinstance(train_dataset_group, train_util.OnlineTEDatasetWrapper) else None
     )
 
     # 学習ステップ数を計算する
@@ -1264,5 +1281,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     train_util.verify_command_line_training_args(args)
     args = train_util.read_config_from_file(args, parser)
+
+    if args.text_encoder_device != 'auto':
+        torch.multiprocessing.set_start_method('spawn')
 
     train(args)
