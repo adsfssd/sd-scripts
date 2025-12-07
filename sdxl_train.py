@@ -783,6 +783,10 @@ def train(args):
             init_kwargs=init_kwargs,
         )
 
+    needs_dynamic_shift = (
+        args.flow_model and args.flow_uniform_shift and args.flow_uniform_static_ratio is None
+    )
+
     # For --sample_at_first
     sdxl_train_util.sample_images(
         accelerator, args, 0, global_step, accelerator.device, vae, [tokenizer1, tokenizer2], [text_encoder1, text_encoder2], unet
@@ -885,10 +889,8 @@ def train(args):
                     vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
                     text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
 
-                needs_dynamic_shift = (
-                    args.flow_model and args.flow_uniform_shift and args.flow_uniform_static_ratio is None
-                )
                 if needs_dynamic_shift:
+                    target_size = batch["target_sizes_hw"]
                     if target_size is None:
                         raise ValueError(
                             "Resolution-dependent Rectified Flow shift requires target size information in the batch."
