@@ -786,6 +786,24 @@ def train(args):
     needs_dynamic_shift = (
         args.flow_model and args.flow_uniform_shift and args.flow_uniform_static_ratio is None
     )
+    # unload the models from cpu
+    te1 = text_encoder1.to(text_encoder1.device)
+    te2 = text_encoder2.to(text_encoder2.device)
+    v = vae.to(vae.device)
+    u = unet.to(unet.device)
+
+    del text_encoder1
+    del text_encoder2
+    del vae
+    del unet
+
+    import gc
+    gc.collect()
+
+    text_encoder1 = te1
+    text_encoder2 = te2
+    vae = v
+    unet = u
 
     # For --sample_at_first
     sdxl_train_util.sample_images(
