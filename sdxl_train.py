@@ -818,68 +818,72 @@ def train(args):
                     latents = latents - args.vae_shift_factor
                 latents = latents * args.vae_scale_factor
 
-                if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
-                    input_ids1 = batch["input_ids"]
-                    input_ids2 = batch["input_ids2"]
-                    with torch.set_grad_enabled(args.train_text_encoder):
-                        # Get the text embedding for conditioning
-                        # TODO support weighted captions
-                        # if args.weighted_captions:
-                        #     encoder_hidden_states = get_weighted_text_embeddings(
-                        #         tokenizer,
-                        #         text_encoder,
-                        #         batch["captions"],
-                        #         accelerator.device,
-                        #         args.max_token_length // 75 if args.max_token_length else 1,
-                        #         clip_skip=args.clip_skip,
-                        #     )
-                        # else:
-                        input_ids1 = input_ids1.to(text_encoder1.device)
-                        input_ids2 = input_ids2.to(text_encoder2.device)
-                        # unwrap_model is fine for models not wrapped by accelerator
-                        encoder_hidden_states1, encoder_hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
-                            args.max_token_length,
-                            args.use_zero_cond_dropout,
-                            input_ids1,
-                            input_ids2,
-                            tokenizer1,
-                            tokenizer2,
-                            text_encoder1,
-                            text_encoder2,
-                            None if not args.full_fp16 else weight_dtype,
-                            accelerator=accelerator,
-                        )
+                if "cached_vector_embedding" in batch and batch["cached_vector_embedding"] is not None:
+                    vector_embedding = batch["cached_vector_embedding"]
+                    text_embedding = batch["cached_text_embedding"]
                 else:
-                    encoder_hidden_states1 = batch["text_encoder_outputs1_list"].to(accelerator.device).to(weight_dtype)
-                    encoder_hidden_states2 = batch["text_encoder_outputs2_list"].to(accelerator.device).to(weight_dtype)
-                    pool2 = batch["text_encoder_pool2_list"].to(accelerator.device).to(weight_dtype)
+                    if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
+                        input_ids1 = batch["input_ids"]
+                        input_ids2 = batch["input_ids2"]
+                        with torch.set_grad_enabled(args.train_text_encoder):
+                            # Get the text embedding for conditioning
+                            # TODO support weighted captions
+                            # if args.weighted_captions:
+                            #     encoder_hidden_states = get_weighted_text_embeddings(
+                            #         tokenizer,
+                            #         text_encoder,
+                            #         batch["captions"],
+                            #         accelerator.device,
+                            #         args.max_token_length // 75 if args.max_token_length else 1,
+                            #         clip_skip=args.clip_skip,
+                            #     )
+                            # else:
+                            input_ids1 = input_ids1.to(text_encoder1.device)
+                            input_ids2 = input_ids2.to(text_encoder2.device)
+                            # unwrap_model is fine for models not wrapped by accelerator
+                            encoder_hidden_states1, encoder_hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
+                                args.max_token_length,
+                                args.use_zero_cond_dropout,
+                                input_ids1,
+                                input_ids2,
+                                tokenizer1,
+                                tokenizer2,
+                                text_encoder1,
+                                text_encoder2,
+                                None if not args.full_fp16 else weight_dtype,
+                                accelerator=accelerator,
+                            )
+                    else:
+                        encoder_hidden_states1 = batch["text_encoder_outputs1_list"].to(accelerator.device).to(weight_dtype)
+                        encoder_hidden_states2 = batch["text_encoder_outputs2_list"].to(accelerator.device).to(weight_dtype)
+                        pool2 = batch["text_encoder_pool2_list"].to(accelerator.device).to(weight_dtype)
 
-                    # # verify that the text encoder outputs are correct
-                    # ehs1, ehs2, p2 = train_util.get_hidden_states_sdxl(
-                    #     args.max_token_length,
-                    #     batch["input_ids"].to(text_encoder1.device),
-                    #     batch["input_ids2"].to(text_encoder1.device),
-                    #     tokenizer1,
-                    #     tokenizer2,
-                    #     text_encoder1,
-                    #     text_encoder2,
-                    #     None if not args.full_fp16 else weight_dtype,
-                    # )
-                    # b_size = encoder_hidden_states1.shape[0]
-                    # assert ((encoder_hidden_states1.to("cpu") - ehs1.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
-                    # assert ((encoder_hidden_states2.to("cpu") - ehs2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
-                    # assert ((pool2.to("cpu") - p2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
-                    # logger.info("text encoder outputs verified")
+                        # # verify that the text encoder outputs are correct
+                        # ehs1, ehs2, p2 = train_util.get_hidden_states_sdxl(
+                        #     args.max_token_length,
+                        #     batch["input_ids"].to(text_encoder1.device),
+                        #     batch["input_ids2"].to(text_encoder1.device),
+                        #     tokenizer1,
+                        #     tokenizer2,
+                        #     text_encoder1,
+                        #     text_encoder2,
+                        #     None if not args.full_fp16 else weight_dtype,
+                        # )
+                        # b_size = encoder_hidden_states1.shape[0]
+                        # assert ((encoder_hidden_states1.to("cpu") - ehs1.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
+                        # assert ((encoder_hidden_states2.to("cpu") - ehs2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
+                        # assert ((pool2.to("cpu") - p2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
+                        # logger.info("text encoder outputs verified")
 
-                # get size embeddings
-                orig_size = batch["original_sizes_hw"]
-                crop_size = batch["crop_top_lefts"]
-                target_size = batch["target_sizes_hw"]
-                embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
+                    # get size embeddings
+                    orig_size = batch["original_sizes_hw"]
+                    crop_size = batch["crop_top_lefts"]
+                    target_size = batch["target_sizes_hw"]
+                    embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
 
-                # concat embeddings
-                vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
-                text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+                    # concat embeddings
+                    vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
+                    text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
 
                 needs_dynamic_shift = (
                     args.flow_model and args.flow_uniform_shift and args.flow_uniform_static_ratio is None

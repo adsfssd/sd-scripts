@@ -77,6 +77,7 @@ import library.huggingface_util as huggingface_util
 import library.sai_model_spec as sai_model_spec
 import library.deepspeed_utils as deepspeed_utils
 from library.utils import setup_logging, pil_resize
+from library.sdxl_train_util import get_size_embeddings
 
 setup_logging()
 import logging
@@ -2553,7 +2554,7 @@ class OnlineTEDatasetWrapper(torch.utils.data.Dataset):
                 input_ids1 = input_ids1.to(self._text_encoder1.device)
                 input_ids2 = input_ids2.to(self._text_encoder2.device)
                 # unwrap_model is fine for models not wrapped by accelerator
-                encoder_hidden_states1, encoder_hidden_states2, pool2 = get_hidden_states_sdxl(
+                encoder_hidden_states1, encoder_hidden_states2, pool2 = [t.to(self._weight_dtype) for t in get_hidden_states_sdxl(
                     self._args.max_token_length,
                     self._args.use_zero_cond_dropout,
                     input_ids1,
@@ -2564,11 +2565,21 @@ class OnlineTEDatasetWrapper(torch.utils.data.Dataset):
                     self._text_encoder2,
                     None if not self._args.full_fp16 else self._weight_dtype,
                     accelerator=None,
-                )
+                )]
         
-            batch["text_encoder_outputs1_list"] = encoder_hidden_states1.to(self._weight_dtype).cpu()
-            batch["text_encoder_outputs2_list"] = encoder_hidden_states2.to(self._weight_dtype).cpu()
-            batch["text_encoder_pool2_list"] = pool2.to(self._weight_dtype).cpu()
+            # get size embeddings
+            orig_size = batch["original_sizes_hw"]
+            crop_size = batch["crop_top_lefts"]
+            target_size = batch["target_sizes_hw"]
+            embs = get_size_embeddings(orig_size, crop_size, target_size, self._text_encoder1.device).to(self._weight_dtype)
+
+            # concat embeddings
+            vector_embedding = torch.cat([pool2, embs], dim=1).to(self._weight_dtype)
+            text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(self._weight_dtype)
+
+            batch["cached_vector_embedding"] = vector_embedding.cpu()
+            batch["cached_text_embedding"] = text_embedding.cpu()
+
         return batch
     
     def set_max_train_steps(self, *args):
