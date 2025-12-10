@@ -2524,8 +2524,8 @@ class OnlineTEDatasetWrapper(torch.utils.data.Dataset):
         super().__init__()
 
         self._dataset = dataset
-        self._text_encoder1 = text_encoder1
-        self._text_encoder2 = text_encoder2
+        self._text_encoder1 = torch.compile(text_encoder1)
+        self._text_encoder2 = torch.compile(text_encoder2)
         self._tokenizer1 = tokenizer1
         self._tokenizer2 = tokenizer2
 
@@ -2536,7 +2536,7 @@ class OnlineTEDatasetWrapper(torch.utils.data.Dataset):
     def worker_init_fn(worker_id):
         # pytorch sets number of threads to 1 by default for dataloader processes
         num_workers = torch.utils.data.get_worker_info().num_workers
-        torch.set_num_threads(os.cpu_count() // (2 * num_workers))
+        torch.set_num_threads(max(os.cpu_count() // (num_workers) - 2, 1))
         
     def __len__(self):
         return len(self._dataset)
