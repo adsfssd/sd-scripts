@@ -5574,7 +5574,7 @@ def get_noise_noisy_latents_and_timesteps(
             t_ref = sigmas
             sigmas = ratios * t_ref / (1 + (ratios - 1) * t_ref)
 
-        timesteps = torch.clamp((sigmas * timestep_max).long(), 1, timestep_max)
+        timesteps = torch.clamp((sigmas * timestep_max).round().long(), 1, timestep_max)
         _, huber_c = get_timesteps_and_huber_c(
             args,
             0,
