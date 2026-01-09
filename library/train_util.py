@@ -3553,6 +3553,34 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
     #     help="enable perlin noise and set the octaves / perlin noiseを有効にしてoctavesをこの値に設定する",
     # )
     parser.add_argument(
+        "--jit_loss_type",
+        type=str,
+        default=None,
+        choices=['v', 'x0', 'eps'],
+        help="Loss space to use according to JIT"
+    )
+    parser.add_argument(
+        "--jit_pred_type",
+        type=str,
+        default=None,
+        choices=['v', 'x0', 'eps'],
+        help="Model prediction space to use according to JIT"
+    )
+    parser.add_argument(
+        "--jit_loss_weights",
+        type=float,
+        nargs=3,
+        metavar=('x0_mult', 'v_mult', 'eps_mult'),
+        default=None,
+        help="Perform weighted average across loss types"
+    )
+    parser.add_argument(
+        "--jit_t_eps",
+        type=float,
+        default=1e-2,
+        help="t_eps to avoid division errors when converting loss types"
+    )
+    parser.add_argument(
         "--multires_noise_discount",
         type=float,
         default=0.3,

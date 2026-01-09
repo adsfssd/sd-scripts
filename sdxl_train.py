@@ -930,7 +930,10 @@ def train(args):
                     noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
 
                 if args.flow_model:
-                    target = noise - latents
+                    if args.jit_pred_type is not None and args.jit_loss_type is not None:
+                        target, noise_pred = train_util.apply_jit_pred(args, noise_pred, latents, noise, noisy_latents, timesteps)
+                    else:
+                        target = noise - latents
                 elif args.v_parameterization:
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
@@ -1295,6 +1298,34 @@ def setup_parser() -> argparse.ArgumentParser:
         type=str,
         default="auto",
         help="Select the device to move text encoder to. Only effective if text encoder is not trained.",
+    )
+    parser.add_argument(
+        "--jit_loss_type",
+        type=str,
+        default=None,
+        choices=['v', 'x0', 'eps'],
+        help="Loss space to use according to JIT"
+    )
+    parser.add_argument(
+        "--jit_pred_type",
+        type=str,
+        default=None,
+        choices=['v', 'x0', 'eps'],
+        help="Model prediction space to use according to JIT"
+    )
+    parser.add_argument(
+        "--jit_loss_weights",
+        type=float,
+        nargs=3,
+        metavar=('x0_mult', 'v_mult', 'eps_mult'),
+        default=None,
+        help="Sum all three loss types according to weighting"
+    )
+    parser.add_argument(
+        "--jit_t_eps",
+        type=float,
+        default=1e-2,
+        help="t_eps to avoid division errors when converting loss types"
     )
     return parser
 
