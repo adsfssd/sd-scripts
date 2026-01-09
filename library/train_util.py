@@ -5574,7 +5574,7 @@ def get_noise_noisy_latents_and_timesteps(
             t_ref = sigmas
             sigmas = ratios * t_ref / (1 + (ratios - 1) * t_ref)
 
-        timesteps = torch.clamp((sigmas * timestep_max).long(), 0, timestep_max)
+        timesteps = torch.clamp((sigmas * timestep_max).long(), 1, timestep_max)
         _, huber_c = get_timesteps_and_huber_c(
             args,
             0,
@@ -5584,6 +5584,7 @@ def get_noise_noisy_latents_and_timesteps(
             latents.device,
             timesteps_override=timesteps,
         )
+        sigmas = timesteps / timestep_max
     else:
         min_timestep = 0 if args.min_timestep is None else args.min_timestep
         max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
