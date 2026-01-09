@@ -5514,6 +5514,60 @@ def _scipy_assignment(cost: torch.Tensor):
     return cost, (row, col)
 
 
+def apply_jit_pred(args, model_output, latents, noise, zt, timesteps):
+    t_eps = args.jit_t_eps
+    timestep_max = noise_scheduler.config.num_train_timesteps - 1 if args.max_timestep is None else args.max_timestep - 1
+    t = timesteps.view(-1, 1, 1, 1) / timestep_max
+   
+    if args.jit_loss_type == 'x0':
+        target = latents
+    elif args.jit_loss_type == 'v':
+        # sd3: target = noise - latents
+        # jit: target = latents - noise
+        # 
+        # we'll need to flip the target and model output to keep the formulas
+        # as they are in the paper compatible with sd3 schedule
+        target = latents - noise
+    elif args.jit_loss_type == 'eps':
+        target = noise
+
+    if args.jit_pred_type == 'v':
+        # see the comment above
+        model_output = -model_output
+
+    # sd3: t * eps + (1 - t) * latents
+    # jit: t * latents + (1 - t) * eps
+    # we'll need to flip the t
+    t = 1 - t
+
+    if args.jit_pred_type == 'x0':
+        x0_loss_space = model_output
+        v_loss_space = (model_output - zt) / (1 - t).clamp_min(t_eps)
+        eps_loss_space = (zt - t * model_output) / (1 - t).clamp_min(t_eps)
+
+    elif args.jit_pred_type == 'v':
+        x0_loss_space = (1 - t) * model_output + zt
+        v_loss_space = model_output
+        eps_loss_space = zt - t * model_output
+
+    elif args.jit_pred_type == 'eps':
+        x0_loss_space = (zt - (1 - t) * model_output) / t.clamp_min(t_eps)
+        v_loss_space = (zt - model_output) / t.clamp_min(t_eps)
+        eps_loss_space = model_output
+
+    if args.jit_loss_weights is not None:
+        x0_w, v_w, eps_w = args.jit_loss_weights
+        loss_space = (x0_w * x0_loss_space + v_w * v_loss_space + eps_w * eps_loss_space) / sum(args.jit_loss_weights)
+    elif args.jit_loss_type == 'x0':
+        loss_space = x0_loss_space
+    elif args.jit_loss_type == 'v':
+        loss_space = v_loss_space
+    elif args.jit_loss_type == 'eps':
+        loss_space = eps_loss_space
+    
+    return target, loss_space
+
+
 def get_noise_noisy_latents_and_timesteps(
     args,
     noise_scheduler,
