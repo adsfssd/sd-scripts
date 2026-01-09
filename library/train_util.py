@@ -5542,7 +5542,7 @@ def _scipy_assignment(cost: torch.Tensor):
     return cost, (row, col)
 
 
-def apply_jit_pred(args, model_output, latents, noise, zt, timesteps):
+def apply_jit_pred(args, noise_scheduler, model_output, latents, noise, zt, timesteps):
     t_eps = args.jit_t_eps
     timestep_max = noise_scheduler.config.num_train_timesteps - 1 if args.max_timestep is None else args.max_timestep - 1
     t = timesteps.view(-1, 1, 1, 1) / timestep_max

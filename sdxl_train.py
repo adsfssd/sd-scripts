@@ -931,7 +931,7 @@ def train(args):
 
                 if args.flow_model:
                     if args.jit_pred_type is not None and args.jit_loss_type is not None:
-                        target, noise_pred = train_util.apply_jit_pred(args, noise_pred, latents, noise, noisy_latents, timesteps)
+                        target, noise_pred = train_util.apply_jit_pred(args, noise_scheduler, noise_pred, latents, noise, noisy_latents, timesteps)
                     else:
                         target = noise - latents
                 elif args.v_parameterization:
