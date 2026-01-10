@@ -5542,31 +5542,32 @@ def _scipy_assignment(cost: torch.Tensor):
     return cost, (row, col)
 
 
-def apply_jit_pred(args, noise_scheduler, model_output, latents, noise, zt, timesteps):
-    t_eps = args.jit_t_eps
-    timestep_max = noise_scheduler.config.num_train_timesteps - 1 if args.max_timestep is None else args.max_timestep - 1
-    t = timesteps.view(-1, 1, 1, 1) / timestep_max
-   
-    if args.jit_loss_type == 'x0':
+def jit_get_target(target_type, latents, noise):
+    if target_type == 'x0':
         target = latents
-    elif args.jit_loss_type == 'v':
+    elif target_type == 'v':
         # sd3: target = noise - latents
         # jit: target = latents - noise
         # 
         # we'll need to flip the target and model output to keep the formulas
         # as they are in the paper compatible with sd3 schedule
         target = latents - noise
-    elif args.jit_loss_type == 'eps':
+    elif target_type == 'eps':
         target = noise
 
-    if args.jit_pred_type == 'v':
-        # see the comment above
-        model_output = -model_output
+    return target
+
+
+def apply_jit_pred(args, noise_scheduler, model_output, latents, noise, zt, timesteps):
+    t_eps = args.jit_t_eps
+    timestep_max = noise_scheduler.config.num_train_timesteps - 1 if args.max_timestep is None else args.max_timestep - 1
+    t = timesteps.view(-1, 1, 1, 1) / timestep_max
 
     # sd3: t * eps + (1 - t) * latents
     # jit: t * latents + (1 - t) * eps
     # we'll need to flip the t
     t = 1 - t
+
 
     if args.jit_pred_type == 'x0':
         x0_loss_space = model_output
@@ -5574,6 +5575,9 @@ def apply_jit_pred(args, noise_scheduler, model_output, latents, noise, zt, time
         eps_loss_space = (zt - t * model_output) / (1 - t).clamp_min(t_eps)
 
     elif args.jit_pred_type == 'v':
+        # see the comment for jit_get_target, jit's v target is flipped
+        model_output = -model_output
+        
         x0_loss_space = (1 - t) * model_output + zt
         v_loss_space = model_output
         eps_loss_space = zt - t * model_output
@@ -5583,18 +5587,34 @@ def apply_jit_pred(args, noise_scheduler, model_output, latents, noise, zt, time
         v_loss_space = (zt - model_output) / t.clamp_min(t_eps)
         eps_loss_space = model_output
 
+
     if args.jit_loss_weights is not None:
+        # we can concatenate the targets and loss spaces and let the loss function handle that
         x0_w, v_w, eps_w = args.jit_loss_weights
-        loss_space = (x0_w * x0_loss_space + v_w * v_loss_space + eps_w * eps_loss_space) / sum(args.jit_loss_weights)
+        loss_space = torch.cat((x0_loss_space, v_loss_space, eps_loss_space))
+        target = torch.cat([jit_get_target(t, latents, noise) for t in ['x0', 'v', 'eps']])        
+        
     elif args.jit_loss_type == 'x0':
+        target = jit_get_target('x0', latents, noise)
         loss_space = x0_loss_space
+        
     elif args.jit_loss_type == 'v':
+        target = jit_get_target('v', latents, noise)
         loss_space = v_loss_space
+        
     elif args.jit_loss_type == 'eps':
+        target = jit_get_target('eps', latents, noise)
         loss_space = eps_loss_space
     
     return target, loss_space
 
+def apply_jit_weighting(args, loss):
+    weights = torch.tensor(args.jit_loss_weights, device=loss.device)
+    n = weights.shape[0]  # 3 for x0, v, eps
+    b, c, h, w = loss.shape
+    b //= n
+
+    return (loss.view(n, b, c, h, w) * weights.view(n, 1, 1, 1, 1)).sum(dim=0) / weights.sum()
 
 def get_noise_noisy_latents_and_timesteps(
     args,
