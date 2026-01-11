@@ -930,7 +930,10 @@ def train(args):
                     noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
 
                 if args.flow_model:
-                    target = noise - latents
+                    if args.jit_pred_type is not None and args.jit_loss_type is not None:
+                        target, noise_pred = train_util.apply_jit_pred(args, noise_scheduler, noise_pred, latents, noise, noisy_latents, timesteps)
+                    else:
+                        target = noise - latents
                 elif args.v_parameterization:
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
@@ -942,10 +945,15 @@ def train(args):
                     or args.v_pred_like_loss
                     or args.debiased_estimation_loss
                     or args.masked_loss
+                    or args.jit_loss_weights
                 ):
                     loss = train_util.conditional_loss(
                         noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
                     )
+
+                    if args.jit_loss_weights is not None:
+                        train_util.apply_jit_weighting(args, loss)
+                    
                     if args.contrastive_flow_matching and latents.size(0) > 1:
                         negative_latents = latents.roll(1, 0)
                         negative_noise = noise.roll(1, 0)
