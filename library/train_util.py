@@ -5611,7 +5611,6 @@ def apply_jit_pred_implicit(args, noise_scheduler, model_output, latents, noise,
 
     if args.jit_loss_weights is not None:
         # we can concatenate the targets and loss spaces and let the loss function handle that
-        x0_w, v_w, eps_w = args.jit_loss_weights
         loss_space = torch.cat((x0_loss_space, v_loss_space, eps_loss_space))
         target = torch.cat((x0_target, v_target, eps_target))        
         
@@ -5674,7 +5673,6 @@ def apply_jit_pred(args, noise_scheduler, model_output, latents, noise, zt, time
 
     if args.jit_loss_weights is not None:
         # we can concatenate the targets and loss spaces and let the loss function handle that
-        x0_w, v_w, eps_w = args.jit_loss_weights
         loss_space = torch.cat((x0_loss_space, v_loss_space, eps_loss_space))
         target = torch.cat((x0_target, v_target, eps_target))        
         
