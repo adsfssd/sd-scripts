@@ -5542,22 +5542,6 @@ def _scipy_assignment(cost: torch.Tensor):
     return cost, (row, col)
 
 
-def jit_get_target(target_type, latents, noise):
-    if target_type == 'x0':
-        target = latents
-    elif target_type == 'v':
-        # sd3: target = noise - latents
-        # jit: target = latents - noise
-        # 
-        # we'll need to flip the target and model output to keep the formulas
-        # as they are in the paper compatible with sd3 schedule
-        target = latents - noise
-    elif target_type == 'eps':
-        target = noise
-
-    return target
-
-
 def apply_jit_pred(args, noise_scheduler, model_output, latents, noise, zt, timesteps):
     t_eps = args.jit_t_eps
     timestep_max = noise_scheduler.config.num_train_timesteps - 1 if args.max_timestep is None else args.max_timestep - 1
@@ -5568,6 +5552,15 @@ def apply_jit_pred(args, noise_scheduler, model_output, latents, noise, zt, time
     # we'll need to flip the t
     t = 1 - t
 
+    x0_target = latents
+    # sd3: target = noise - latents
+    # jit: target = latents - noise
+    # 
+    # we'll need to flip the target and model output to keep the formulas
+    # as they are in the paper compatible with sd3 schedule
+    v_target = latents - noise
+    eps_target = noise
+
 
     if args.jit_pred_type == 'x0':
         x0_loss_space = model_output
@@ -5575,7 +5568,7 @@ def apply_jit_pred(args, noise_scheduler, model_output, latents, noise, zt, time
         eps_loss_space = (zt - t * model_output) / (1 - t).clamp_min(t_eps)
 
     elif args.jit_pred_type == 'v':
-        # see the comment for jit_get_target, jit's v target is flipped
+        # see the comment above, jit's v target is flipped
         model_output = -model_output
         
         x0_loss_space = (1 - t) * model_output + zt
@@ -5592,18 +5585,18 @@ def apply_jit_pred(args, noise_scheduler, model_output, latents, noise, zt, time
         # we can concatenate the targets and loss spaces and let the loss function handle that
         x0_w, v_w, eps_w = args.jit_loss_weights
         loss_space = torch.cat((x0_loss_space, v_loss_space, eps_loss_space))
-        target = torch.cat([jit_get_target(t, latents, noise) for t in ['x0', 'v', 'eps']])        
+        target = torch.cat((x0_target, v_target, eps_target))        
         
     elif args.jit_loss_type == 'x0':
-        target = jit_get_target('x0', latents, noise)
+        target = x0_target
         loss_space = x0_loss_space
         
     elif args.jit_loss_type == 'v':
-        target = jit_get_target('v', latents, noise)
+        target = v_target
         loss_space = v_loss_space
         
     elif args.jit_loss_type == 'eps':
-        target = jit_get_target('eps', latents, noise)
+        target = eps_target
         loss_space = eps_loss_space
     
     return target, loss_space
