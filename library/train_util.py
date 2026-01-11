@@ -3578,7 +3578,12 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--jit_t_eps",
         type=float,
         default=1e-2,
-        help="t_eps to avoid division errors when converting loss types"
+        help="t_eps to avoid division errors when converting loss types, ignored if implicit scale is used"
+    )
+    parser.add_argument(
+        "--jit_implicit_scale",
+        action="store_true",
+        help="Calculate loss in a scaled space where possible to avoid division instability"
     )
     parser.add_argument(
         "--multires_noise_discount",
@@ -5542,13 +5547,99 @@ def _scipy_assignment(cost: torch.Tensor):
     return cost, (row, col)
 
 
-def apply_jit_pred(args, noise_scheduler, model_output, latents, noise, zt, timesteps):
+def apply_jit_pred_implicit(args, noise_scheduler, model_output, latents, noise, zt, timesteps):
+    # here, we attempt to convert loss/pred types without involving division
+    # MSE(X * v_target, X * v_pred) ~= MSE(v_target, v_pred)
+    # downside/quirk: it changes the loss weighting which may be undesireable
+ 
     t_eps = args.jit_t_eps
     timestep_max = noise_scheduler.config.num_train_timesteps - 1 if args.max_timestep is None else args.max_timestep - 1
     t = timesteps.view(-1, 1, 1, 1) / timestep_max
 
-    # sd3: t * eps + (1 - t) * latents
-    # jit: t * latents + (1 - t) * eps
+    # sd3: t * noise + (1 - t) * latents
+    # jit: t * latents + (1 - t) * noise
+    # we'll need to flip the t
+    t = 1 - t
+
+    if args.jit_pred_type == 'x0':
+        # stable as is
+        x0_target = latents
+        x0_loss_space = model_output
+
+        # sd3: target = noise - latents
+        # jit: target = latents - noise
+        # 
+        # we'll need to flip the target to keep the formulas compatible with sd3 schedule
+        #
+        # v_target = latents - noise
+        # v_loss_space = (model_output - zt) / (1 - t)
+        # 
+        # implicity: let's multiply both sides by (1 - t)
+        #
+        # (1 - t) * v_target = (1 - t) * (latents - noise)
+        # (1 - t) * v_loss_space = model_output - zt
+        #
+        # consider flow eq: zt = t * latents + [(1 - t) * noise]  ->  [(1 - t) * noise] = zt - t * latents
+        # 
+        # consider: (1 - t) * (latents - noise)
+        # = (1 - t) * latents - [(1 - t) * noise]
+        #
+        # substitute:
+        # = (1 - t) * latents - (zt - t * latents)
+        # = latents - zt
+        #
+        v_target = latents - zt
+        v_loss_space = model_output - zt
+
+        # similarly, for eps:
+        # 
+        # eps_target = noise
+        # eps_loss_space = (zt - t * model_output) / (1 - t)
+        #
+        # (1 - t) * eps_target = (1 - t) * noise = zt - t * latents
+        # (1 - t) * eps_loss_space = (1 - t) * (zt - t * model_output) / (1 - t)
+        # 
+        eps_target = zt - t * latents
+        eps_loss_space = zt - t * model_output
+
+    elif args.jit_pred_type == 'v':
+        raise NotImplementedError
+        
+    elif args.jit_pred_type == 'eps':
+        raise NotImplementedError
+
+
+    if args.jit_loss_weights is not None:
+        # we can concatenate the targets and loss spaces and let the loss function handle that
+        x0_w, v_w, eps_w = args.jit_loss_weights
+        loss_space = torch.cat((x0_loss_space, v_loss_space, eps_loss_space))
+        target = torch.cat((x0_target, v_target, eps_target))        
+        
+    elif args.jit_loss_type == 'x0':
+        target = x0_target
+        loss_space = x0_loss_space
+        
+    elif args.jit_loss_type == 'v':
+        target = v_target
+        loss_space = v_loss_space
+        
+    elif args.jit_loss_type == 'eps':
+        target = eps_target
+        loss_space = eps_loss_space
+    
+    return target, loss_space
+
+
+def apply_jit_pred(args, noise_scheduler, model_output, latents, noise, zt, timesteps):
+    if args.jit_implicit_scale:
+        return apply_jit_pred_implicit(args, noise_scheduler, model_output, latents, noise, zt, timesteps)
+
+    t_eps = args.jit_t_eps
+    timestep_max = noise_scheduler.config.num_train_timesteps - 1 if args.max_timestep is None else args.max_timestep - 1
+    t = timesteps.view(-1, 1, 1, 1) / timestep_max
+
+    # sd3: t * noise + (1 - t) * latents
+    # jit: t * latents + (1 - t) * noise
     # we'll need to flip the t
     t = 1 - t
 
